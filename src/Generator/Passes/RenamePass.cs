@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using CppSharp.AST;
+using CppSharp.AST.Extensions;
 
 namespace CppSharp.Passes
 {
@@ -12,18 +13,61 @@ namespace CppSharp.Passes
     /// </summary>
     public abstract class RenamePass : TranslationUnitPass
     {
+        public class ParameterComparer : IEqualityComparer<Parameter>
+        {
+            public bool Equals(Parameter x, Parameter y)
+            {
+                return x.QualifiedType == y.QualifiedType && x.GenerationKind == y.GenerationKind;
+            }
+
+            public int GetHashCode(Parameter obj)
+            {
+                return obj.Type.GetHashCode();
+            }
+        }
+
         public RenameTargets Targets = RenameTargets.Any;
 
         protected RenamePass()
         {
+            Options.VisitFunctionReturnType = false;
+            Options.VisitFunctionParameters = false;
+            Options.VisitTemplateArguments = false;
         }
 
         protected RenamePass(RenameTargets targets)
+            : this()
         {
             Targets = targets;
         }
 
-        public abstract bool Rename(string name, out string newName);
+        public virtual bool Rename(Declaration decl, out string newName)
+        {
+            var method = decl as Method;
+            if (method != null && !method.IsStatic)
+            {
+                var rootBaseMethod = ((Class) method.Namespace).GetBaseMethod(method);
+                if (rootBaseMethod != null && rootBaseMethod != method)
+                {
+                    newName = rootBaseMethod.Name;
+                    return true;
+                }
+            }
+
+            var property = decl as Property;
+            if (property != null && !property.IsStatic)
+            {
+                var rootBaseProperty = ((Class) property.Namespace).GetBaseProperty(property);
+                if (rootBaseProperty != null && rootBaseProperty != property)
+                {
+                    newName = rootBaseProperty.Name;
+                    return true;
+                }
+            }
+
+            newName = decl.Name;
+            return false;
+        }
 
         public bool IsRenameableDecl(Declaration decl)
         {
@@ -40,24 +84,9 @@ namespace CppSharp.Passes
             if (decl is Property) return true;
             if (decl is Event) return true;
             if (decl is TypedefDecl) return true;
+            if (decl is Namespace && !(decl is TranslationUnit)) return true;
+            if (decl is Variable) return true;
             return false;
-        }
-
-        public override bool VisitClassDecl(Class @class)
-        {
-            if (@class.IsDynamic)
-            {
-                // HACK: entries in v-tables are not shared (as objects) with the virtual methods they represent;
-                // this is why this pass has to rename entries in the v-table as well;
-                // this should be fixed in the parser: it should reuse method objects
-                foreach (var method in VTables.GatherVTableMethodEntries(@class).Where(
-                    e => e.Method != null && IsRenameableDecl(e.Method)).Select(e => e.Method))
-                {
-                    Rename(method);
-                }
-            }
-
-            return base.VisitClassDecl(@class);
         }
 
         public override bool VisitDeclaration(Declaration decl)
@@ -77,7 +106,7 @@ namespace CppSharp.Passes
         private bool Rename(Declaration decl)
         {
             string newName;
-            if (Rename(decl.Name, out newName) && !AreThereConflicts(decl, newName))
+            if (Rename(decl, out newName) && !AreThereConflicts(decl, newName))
                 decl.Name = newName;
             return true;
         }
@@ -85,11 +114,22 @@ namespace CppSharp.Passes
         private static bool AreThereConflicts(Declaration decl, string newName)
         {
             var declarations = new List<Declaration>();
-            declarations.AddRange(decl.Namespace.Classes);
+            declarations.AddRange(decl.Namespace.Classes.Where(c => !c.IsIncomplete));
             declarations.AddRange(decl.Namespace.Enums);
             declarations.AddRange(decl.Namespace.Events);
-            declarations.AddRange(decl.Namespace.Functions);
+            var function = decl as Function;
+            if (function != null && function.SynthKind != FunctionSynthKind.AdjustedMethod)
+            {
+                // account for overloads
+                declarations.AddRange(GetFunctionsWithTheSameParams(function));
+            }
+            else
+                declarations.AddRange(decl.Namespace.Functions);
             declarations.AddRange(decl.Namespace.Variables);
+            declarations.AddRange(from typedefDecl in decl.Namespace.Typedefs
+                                  let pointerType = typedefDecl.Type.Desugar() as PointerType
+                                  where pointerType != null && pointerType.Pointee is FunctionType
+                                  select typedefDecl);
 
             var result = declarations.Any(d => d != decl && d.Name == newName);
             if (result)
@@ -102,13 +142,25 @@ namespace CppSharp.Passes
             return ((Class) method.Namespace).GetPropertyByName(newName) != null;
         }
 
+        private static IEnumerable<Function> GetFunctionsWithTheSameParams(Function function)
+        {
+            var method = function as Method;
+            if (method != null)
+            {
+                return ((Class) method.Namespace).Methods.Where(
+                    m => !m.Ignore && m.Parameters.SequenceEqual(function.Parameters, new ParameterComparer()));
+            }
+            return function.Namespace.Functions.Where(
+                f => !f.Ignore && f.Parameters.SequenceEqual(function.Parameters, new ParameterComparer()));
+        }
+
         public override bool VisitEnumItem(Enumeration.Item item)
         {
             if (!Targets.HasFlag(RenameTargets.EnumItem))
                 return false;
 
             string newName;
-            if (Rename(item.Name, out newName))
+            if (Rename(item, out newName))
             {
                 item.Name = newName;
                 return true;
@@ -175,6 +227,14 @@ namespace CppSharp.Passes
 
             return base.VisitEvent(@event);
         }
+
+        public override bool VisitVariableDecl(Variable variable)
+        {
+            if (!Targets.HasFlag(RenameTargets.Variable))
+                return false;
+
+            return base.VisitVariableDecl(variable);
+        }
     }
 
     [Flags]
@@ -190,7 +250,8 @@ namespace CppSharp.Passes
         Event     = 1 << 7,
         Property  = 1 << 8,
         Delegate  = 1 << 9,
-        Any = Function | Method | Parameter | Class | Field | Enum | EnumItem | Event | Property | Delegate,
+        Variable  = 1 << 10,
+        Any = Function | Method | Parameter | Class | Field | Enum | EnumItem | Event | Property | Delegate | Variable
     }
 
     /// <summary>
@@ -214,11 +275,13 @@ namespace CppSharp.Passes
             Targets = targets;
         }
 
-        public override bool Rename(string name, out string newName)
+        public override bool Rename(Declaration decl, out string newName)
         {
-            var replace = Regex.Replace(name, Pattern, Replacement);
+            if (base.Rename(decl, out newName)) return true;
 
-            if (!name.Equals(replace))
+            var replace = Regex.Replace(decl.Name, Pattern, Replacement);
+
+            if (!decl.Name.Equals(replace))
             {
                 newName = replace;
                 return true;
@@ -248,17 +311,17 @@ namespace CppSharp.Passes
             Pattern = pattern;
         }
 
-        public override bool Rename(string name, out string newName)
+        public override bool Rename(Declaration decl, out string newName)
         {
-            newName = null;
+            if (base.Rename(decl, out newName)) return true;
 
             switch (Pattern)
             {
             case RenameCasePattern.LowerCamelCase:
-                newName = ConvertCaseString(name, RenameCasePattern.LowerCamelCase);
+                newName = ConvertCaseString(decl.Name, RenameCasePattern.LowerCamelCase);
                 return true;
             case RenameCasePattern.UpperCamelCase:
-                newName = ConvertCaseString(name, RenameCasePattern.UpperCamelCase);
+                newName = ConvertCaseString(decl.Name, RenameCasePattern.UpperCamelCase);
                 return true;
             }
 
@@ -273,6 +336,10 @@ namespace CppSharp.Passes
         /// <returns>string</returns>
         static string ConvertCaseString(string phrase, RenameCasePattern pattern)
         {
+            // check if it's been renamed to avoid a keyword
+            if (phrase.StartsWith("@"))
+                phrase = phrase.Substring(1);
+
             var splittedPhrase = phrase.Split(' ', '-', '.');
             var sb = new StringBuilder();
 

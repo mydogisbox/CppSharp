@@ -16,7 +16,7 @@
     /// </summary>
     public abstract class PreprocessedEntity : Declaration
     {
-        public MacroLocation Location = MacroLocation.Unknown;
+        public MacroLocation MacroLocation = MacroLocation.Unknown;
     }
 
     /// <summary>
@@ -49,6 +49,9 @@
         // Contains the macro definition text.
         public string Expression;
 
+        // Backing enumeration if one was generated.
+        public Enumeration Enumeration;
+
         public override T Visit<T>(IDeclVisitor<T> visitor)
         {
             return visitor.VisitMacroDefinition(this);
@@ -56,7 +59,7 @@
 
         public override string ToString()
         {
-            return Expression;
+            return string.Format("{0} = {1}", Name, Expression);
         }
     }
 }

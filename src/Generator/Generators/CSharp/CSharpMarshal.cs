@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using CppSharp.AST;
+using CppSharp.AST.Extensions;
 using CppSharp.Types;
 using Type = CppSharp.AST.Type;
 
@@ -11,7 +12,9 @@ namespace CppSharp.Generators.CSharp
     public enum CSharpMarshalKind
     {
         Unknown,
-        NativeField
+        NativeField,
+        GenericDelegate,
+        DefaultExpression
     }
 
     public class CSharpMarshalContext : MarshalContext
@@ -29,15 +32,11 @@ namespace CppSharp.Generators.CSharp
 
         public TextGenerator ArgumentPrefix { get; private set; }
         public TextGenerator Cleanup { get; private set; }
+        public bool HasFixedBlock { get; set; }
     }
 
-    public abstract class CSharpMarshalPrinter : MarshalPrinter
+    public abstract class CSharpMarshalPrinter : MarshalPrinter<CSharpMarshalContext>
     {
-        public CSharpMarshalContext CSharpContext
-        {
-            get { return Context as CSharpMarshalContext; }
-        }
-
         protected CSharpMarshalPrinter(CSharpMarshalContext context)
             : base(context)
         {
@@ -57,10 +56,9 @@ namespace CppSharp.Generators.CSharp
         public CSharpMarshalNativeToManagedPrinter(CSharpMarshalContext context)
             : base(context)
         {
-            Context.MarshalToManaged = this;
         }
 
-        public int VarSuffix { get; set; }
+        public bool MarshalsParameter { get; set; }
 
         public static string QualifiedIdentifier(Declaration decl)
         {
@@ -84,7 +82,7 @@ namespace CppSharp.Generators.CSharp
         public override bool VisitType(Type type, TypeQualifiers quals)
         {
             TypeMap typeMap;
-            if (Context.Driver.TypeDatabase.FindTypeMap(type, out typeMap))
+            if (Context.Driver.TypeDatabase.FindTypeMap(type, out typeMap) && typeMap.DoesMarshalling)
             {
                 typeMap.Type = type;
                 typeMap.CSharpMarshalToManaged(Context);
@@ -97,7 +95,7 @@ namespace CppSharp.Generators.CSharp
         public override bool VisitDeclaration(Declaration decl)
         {
             TypeMap typeMap;
-            if (Context.Driver.TypeDatabase.FindTypeMap(decl, out typeMap))
+            if (Context.Driver.TypeDatabase.FindTypeMap(decl, out typeMap) && typeMap.DoesMarshalling)
             {
                 typeMap.Declaration = decl;
                 typeMap.CSharpMarshalToManaged(Context);
@@ -112,22 +110,25 @@ namespace CppSharp.Generators.CSharp
             if (!VisitType(array, quals))
                 return false;
 
+            Class @class;
             switch (array.SizeType)
             {
                 case ArrayType.ArraySize.Constant:
                     var supportBefore = Context.SupportBefore;
                     string value = Generator.GeneratedIdentifier("value");
-                    supportBefore.WriteLine("{0}[] {1} = new {0}[{2}];", array.Type, value, array.Size);
-                    string v = Generator.GeneratedIdentifier("v");
-                    supportBefore.WriteLine("fixed ({0}* {1} = {2})", array.Type, v, value);
+                    supportBefore.WriteLine("{0}[] {1} = null;", array.Type, value, array.Size);
+                    supportBefore.WriteLine("if ({0} != null)", Context.ReturnVarName);
                     supportBefore.WriteStartBraceIndent();
-                    string to = Generator.GeneratedIdentifier("to");
-                    supportBefore.WriteLine("{0}* {1} = {2};", array.Type, to, v);
-                    string from = Generator.GeneratedIdentifier("from");
-                    supportBefore.WriteLine("{0}* {1} = {2};",
-                        array.Type, from, Context.ReturnVarName);
+                    supportBefore.WriteLine("{0} = new {1}[{2}];", value, array.Type, array.Size);
                     supportBefore.WriteLine("for (int i = 0; i < {0}; i++)", array.Size);
-                    supportBefore.WriteLineIndent("*{0}++ = *{1}++;", to, from);
+                    if (array.Type.IsPointerToPrimitiveType(PrimitiveType.Void))
+                        supportBefore.WriteLineIndent("{0}[i] = new global::System.IntPtr({1}[i]);",
+                            value, Context.ReturnVarName);
+                    else if (array.Type.Desugar().TryGetClass(out @class) && @class.IsRefType)
+                        supportBefore.WriteLineIndent("{0}[i] = {1}.{2}(*(({1}.Internal*)&({3}[i * sizeof({1}.Internal)])));", 
+                            value, array.Type, Helpers.CreateInstanceIdentifier, Context.ReturnVarName);
+                    else
+                        supportBefore.WriteLineIndent("{0}[i] = {1}[i];", value, Context.ReturnVarName);
                     supportBefore.WriteCloseBraceIndent();
                     Context.Return.Write(value);
                     break;
@@ -144,24 +145,31 @@ namespace CppSharp.Generators.CSharp
             if (!VisitType(pointer, quals))
                 return false;
 
-            var pointee = pointer.Pointee.Desugar();
+            var param = Context.Parameter;
+            var isRefParam = param != null && (param.IsInOut || param.IsOut);
 
-            if (CSharpTypePrinter.IsConstCharString(pointer))
+            var pointee = pointer.Pointee.Desugar();
+            bool marshalPointeeAsString = CSharpTypePrinter.IsConstCharString(pointee) && isRefParam;
+
+            if (CSharpTypePrinter.IsConstCharString(pointer) || marshalPointeeAsString)
             {
-                Context.Return.Write(MarshalStringToManaged(Context.ReturnVarName));
+                Context.Return.Write(MarshalStringToManaged(Context.ReturnVarName,
+                    pointer.GetFinalPointee() as BuiltinType));
                 return true;
             }
 
+            var finalPointee = pointer.GetFinalPointee();
             PrimitiveType primitive;
-            if (pointee.IsPrimitiveType(out primitive))
+            if (finalPointee.IsPrimitiveType(out primitive) || finalPointee.IsEnumType())
             {
-                var param = Context.Parameter;
-                if (param != null && (param.IsOut || param.IsInOut))
+                if (isRefParam)
                 {
                     Context.Return.Write("_{0}", param.Name);
                     return true;
                 }
 
+                if (Context.Driver.Options.MarshalCharAsManagedChar && primitive == PrimitiveType.Char)
+                    Context.Return.Write(string.Format("({0}) ", pointer));
                 Context.Return.Write(Context.ReturnVarName);
                 return true;
             }
@@ -169,19 +177,27 @@ namespace CppSharp.Generators.CSharp
             return pointer.Pointee.Visit(this, quals);
         }
 
-        private string MarshalStringToManaged(string varName)
+        private string MarshalStringToManaged(string varName, BuiltinType type)
         {
-            if (Equals(Context.Driver.Options.Encoding, Encoding.ASCII))
-            {
+            var isChar = type.Type == PrimitiveType.Char;
+            var encoding = isChar ? Encoding.ASCII : Encoding.Unicode;
+
+            if (Equals(encoding, Encoding.ASCII))
+                encoding = Context.Driver.Options.Encoding;
+
+            if (Equals(encoding, Encoding.ASCII))
                 return string.Format("Marshal.PtrToStringAnsi({0})", varName);
-            }
-            if (Equals(Context.Driver.Options.Encoding, Encoding.Unicode) ||
-                Equals(Context.Driver.Options.Encoding, Encoding.BigEndianUnicode))
-            {
+
+            // If we reach this, we know the string is Unicode.
+            if (type.Type == PrimitiveType.Char ||
+                Context.Driver.TargetInfo.WCharWidth == 16)
                 return string.Format("Marshal.PtrToStringUni({0})", varName);
-            }
-            throw new NotSupportedException(string.Format("{0} is not supported yet.",
-                Context.Driver.Options.Encoding.EncodingName));
+
+            // If we reach this, we should have an UTF-32 wide string.
+            const string encodingName = "System.Text.Encoding.UTF32";
+            return string.Format(
+                "CppSharp.Runtime.Helpers.MarshalEncodedString({0}, {1})",
+                varName, encodingName);
         }
 
         public override bool VisitPrimitiveType(PrimitiveType primitive, TypeQualifiers quals)
@@ -190,24 +206,25 @@ namespace CppSharp.Generators.CSharp
             {
                 case PrimitiveType.Void:
                     return true;
+                case PrimitiveType.Char:
+                    // returned structs must be blittable and char isn't
+                    if (Context.Driver.Options.MarshalCharAsManagedChar)
+                        Context.Return.Write("(char) ");
+                    goto default;
+                case PrimitiveType.Char16:
+                    return false;
                 case PrimitiveType.Bool:
-                case PrimitiveType.Int8:
-                case PrimitiveType.UInt8:
-                case PrimitiveType.Int16:
-                case PrimitiveType.UInt16:
-                case PrimitiveType.Int32:
-                case PrimitiveType.UInt32:
-                case PrimitiveType.Int64:
-                case PrimitiveType.UInt64:
-                case PrimitiveType.Float:
-                case PrimitiveType.Double:
+                    if (Context.Kind == CSharpMarshalKind.NativeField)
+                    {
+                        // returned structs must be blittable and bool isn't
+                        Context.Return.Write("{0} != 0", Context.ReturnVarName);
+                        return true;
+                    }
+                    goto default;
+                default:
                     Context.Return.Write(Context.ReturnVarName);
                     return true;
-                case PrimitiveType.WideChar:
-                    return false;
             }
-
-            throw new NotImplementedException();
         }
 
         public override bool VisitTypedefType(TypedefType typedef, TypeQualifiers quals)
@@ -234,64 +251,30 @@ namespace CppSharp.Generators.CSharp
             return decl.Type.Visit(this);
         }
 
+        public override bool VisitFunctionType(FunctionType function, TypeQualifiers quals)
+        {
+            var ptrName = Generator.GeneratedIdentifier("ptr") + Context.ParameterIndex;
+
+            Context.SupportBefore.WriteLine("var {0} = {1};", ptrName,
+                Context.ReturnVarName);
+
+            Context.Return.Write("({1})Marshal.GetDelegateForFunctionPointer({0}, typeof({1}))",
+                ptrName, function.ToString());
+            return true;
+        }
+
         public override bool VisitClassDecl(Class @class)
         {
-            var ctx = Context as CSharpMarshalContext;
+            var originalClass = @class.OriginalClass ?? @class;
+            Type returnType = Context.ReturnType.Type.Desugar();
 
-            string instance = Context.ReturnVarName;
-            if (ctx.Kind == CSharpMarshalKind.NativeField)
-            {
-                string copy = Generator.GeneratedIdentifier("copy");
-                if (VarSuffix > 0)
-                    copy += VarSuffix;
-                Context.SupportBefore.WriteLine(
-                    "var {0} = new global::System.IntPtr(&{1});", copy, instance);
-                instance = copy;
-            }
+            // if the class is an abstract impl, use the original for the object map
+            var qualifiedClass = QualifiedIdentifier(originalClass);
 
-            if (@class.IsRefType &&
-                (Context.ReturnType.Qualifiers.IsConst || !Context.ReturnType.Type.IsAddress()) &&
-                (!Context.Driver.Options.GenerateAbstractImpls || !@class.IsAbstract))
-            {
-                var instanceName = Generator.GeneratedIdentifier("instance");
-                if (VarSuffix > 0)
-                    instanceName += VarSuffix;
-
-                // Allocate memory for a new native object and call the ctor.
-                Context.SupportBefore.WriteLine("var {0} = Marshal.AllocHGlobal({1});",
-                    instanceName, @class.Layout.Size);
-
-                if (@class.HasNonTrivialCopyConstructor)
-                {
-                    // Find a valid copy constructor overload.
-                    var copyCtorMethod = @class.Methods.FirstOrDefault(method =>
-                        method.IsCopyConstructor);
-
-                    if (copyCtorMethod == null)
-                        throw new NotSupportedException("Expected a valid copy constructor");
-
-                    // Call the copy constructor.
-                    Context.SupportBefore.WriteLine("{0}.Internal.{1}({2}, new global::System.IntPtr(&{3}));",
-                        QualifiedIdentifier(@class),
-                        CSharpTextTemplate.GetFunctionNativeIdentifier(copyCtorMethod),
-                        instanceName, instance);
-                }
-                else
-                {
-                    instance = instance.Trim('*');
-                    Context.SupportBefore.WriteLine(
-                        "CppSharp.Runtime.Helpers.memcpy({0}, new IntPtr(&{1}), new UIntPtr({2}));",
-                        instanceName, instance, @class.Layout.Size);
-                }
-
-                instance = instanceName;
-            }
-
-            Context.Return.Write("new {0}({1})",
-                QualifiedIdentifier(@class.OriginalClass ?? @class) +
-                (Context.Driver.Options.GenerateAbstractImpls && @class.IsAbstract ?
-                    "Internal" : ""),
-                instance);
+            if (returnType.IsAddress())
+                Context.Return.Write(HandleReturnedPointer(@class, qualifiedClass));
+            else
+                Context.Return.Write("{0}.{1}({2})", qualifiedClass, Helpers.CreateInstanceIdentifier, Context.ReturnVarName);
 
             return true;
         }
@@ -307,10 +290,10 @@ namespace CppSharp.Generators.CSharp
             if (parameter.Usage == ParameterUsage.Unknown || parameter.IsIn)
                 return base.VisitParameterDecl(parameter);
 
-            var ctx = new CSharpMarshalContext(base.Context.Driver)
+            var ctx = new CSharpMarshalContext(Context.Driver)
             {
-                ReturnType = base.Context.ReturnType,
-                ReturnVarName = base.Context.ReturnVarName
+                ReturnType = Context.ReturnType,
+                ReturnVarName = Context.ReturnVarName
             };
 
             var marshal = new CSharpMarshalNativeToManagedPrinter(ctx);
@@ -319,14 +302,54 @@ namespace CppSharp.Generators.CSharp
             if (!string.IsNullOrWhiteSpace(ctx.SupportBefore))
                 Context.SupportBefore.WriteLine(ctx.SupportBefore);
 
-            if (!string.IsNullOrWhiteSpace(ctx.Return))
+            if (!string.IsNullOrWhiteSpace(ctx.Return) &&
+                !parameter.Type.IsPrimitiveTypeConvertibleToRef())
             {
                 Context.SupportBefore.WriteLine("var _{0} = {1};", parameter.Name,
                     ctx.Return);
             }
 
-            Context.Return.Write("_{0}", parameter.Name);
+            Context.Return.Write("{0}{1}",
+                parameter.Type.IsPrimitiveTypeConvertibleToRef() ? "ref *" : "_", parameter.Name);
             return true;
+        }
+
+        private string HandleReturnedPointer(Class @class, string qualifiedClass)
+        {
+            var originalClass = @class.OriginalClass ?? @class;
+            var ret = Generator.GeneratedIdentifier("result") + Context.ParameterIndex;
+            var qualifiedIdentifier = QualifiedIdentifier(@class);
+            Context.SupportBefore.WriteLine("{0} {1};", qualifiedIdentifier, ret);
+            Context.SupportBefore.WriteLine("if ({0} == IntPtr.Zero) {1} = {2};", Context.ReturnVarName, ret,
+                originalClass.IsRefType ? "null" : string.Format("new {0}()", qualifiedClass));
+            if (originalClass.IsRefType)
+            {
+                Context.SupportBefore.WriteLine(
+                    "else if ({0}.NativeToManagedMap.ContainsKey({1}))", qualifiedClass, Context.ReturnVarName);
+                Context.SupportBefore.WriteLineIndent("{0} = ({1}) {2}.NativeToManagedMap[{3}];",
+                    ret, qualifiedIdentifier, qualifiedClass, Context.ReturnVarName);
+                var dtor = originalClass.Destructors.FirstOrDefault();
+                if (dtor != null && dtor.IsVirtual)
+                {
+                    Context.SupportBefore.WriteLine("else {0}{1} = ({2}) {3}.{4}({5}{6});",
+                        MarshalsParameter
+                            ? string.Empty
+                            : string.Format("{0}.NativeToManagedMap[{1}] = ", qualifiedClass, Context.ReturnVarName),
+                        ret, qualifiedIdentifier, qualifiedClass, Helpers.CreateInstanceIdentifier, Context.ReturnVarName,
+                        MarshalsParameter ? ", skipVTables: true" : string.Empty);
+                }
+                else
+                {
+                    Context.SupportBefore.WriteLine("else {0} = {1}.{2}({3});", ret, qualifiedClass,
+                        Helpers.CreateInstanceIdentifier, Context.ReturnVarName);
+                }
+            }
+            else
+            {
+                Context.SupportBefore.WriteLine("else {0} = {1}.{2}({3});", ret, qualifiedClass,
+                    Helpers.CreateInstanceIdentifier, Context.ReturnVarName);
+            }
+            return ret;
         }
     }
 
@@ -335,13 +358,12 @@ namespace CppSharp.Generators.CSharp
         public CSharpMarshalManagedToNativePrinter(CSharpMarshalContext context)
             : base(context)
         {
-            Context.MarshalToNative = this;
         }
 
         public override bool VisitType(Type type, TypeQualifiers quals)
         {
             TypeMap typeMap;
-            if (Context.Driver.TypeDatabase.FindTypeMap(type, out typeMap))
+            if (Context.Driver.TypeDatabase.FindTypeMap(type, out typeMap) && typeMap.DoesMarshalling)
             {
                 typeMap.Type = type;
                 typeMap.CSharpMarshalToNative(Context);
@@ -354,7 +376,7 @@ namespace CppSharp.Generators.CSharp
         public override bool VisitDeclaration(Declaration decl)
         {
             TypeMap typeMap;
-            if (Context.Driver.TypeDatabase.FindTypeMap(decl, out typeMap))
+            if (Context.Driver.TypeDatabase.FindTypeMap(decl, out typeMap) && typeMap.DoesMarshalling)
             {
                 typeMap.Declaration = decl;
                 typeMap.CSharpMarshalToNative(Context);
@@ -372,23 +394,40 @@ namespace CppSharp.Generators.CSharp
             switch (array.SizeType)
             {
                 case ArrayType.ArraySize.Constant:
-                    var supportBefore = Context.SupportBefore;
-                    supportBefore.WriteLine("if ({0}.Length != {1})",
-                        Context.ArgName, array.Size);
-                    supportBefore.WriteLineIndent(
-                        "throw new ArgumentException(\"The value must be an array of size {0}.\");",
-                        array.Size);
-                    string v = Generator.GeneratedIdentifier("v");
-                    supportBefore.WriteLine("fixed ({0}* {1} = {2})", array.Type, v, Context.ArgName);
-                    supportBefore.WriteLineIndent("for (int i = 0; i < {0}; i++)", array.Size);
-                    supportBefore.PushIndent();
-                    supportBefore.WriteLineIndent("*({0}->{1} + i) = *({2} + i);",
-                        Generator.GeneratedIdentifier("ptr"), Context.ReturnVarName, v);
-                    supportBefore.PopIndent();
-                    supportBefore.WriteLine("fixed ({0}* {1} = {2})", array.Type, v, Context.ArgName);
-                    supportBefore.PushIndent();
-                    supportBefore.Write("*");
-                    Context.Return.Write("*{0}", v);
+                    if (string.IsNullOrEmpty(Context.ReturnVarName))
+                    {
+                        Context.SupportBefore.WriteLine("if ({0} == null || {0}.Length != {1})", Context.Parameter.Name, array.Size);
+                        ThrowArgumentOutOfRangeException();
+                        const string ptr = "__ptr";
+                        Context.SupportBefore.WriteLine("fixed ({0}* {1} = {2})", array.Type, ptr, Context.Parameter.Name);
+                        Context.SupportBefore.WriteStartBraceIndent();
+                        Context.Return.Write("new global::System.IntPtr({0})", ptr);
+                        Context.HasFixedBlock = true;
+                    }
+                    else
+                    {
+                        var supportBefore = Context.SupportBefore;
+                        supportBefore.WriteLine("if ({0} != null)", Context.ArgName);
+                        supportBefore.WriteStartBraceIndent();
+                        Class @class;
+                        if (array.Type.Desugar().TryGetClass(out @class) && @class.IsRefType)
+                        {
+                            supportBefore.WriteLine("if (value.Length != {0})", array.Size);
+                            ThrowArgumentOutOfRangeException();
+                        }
+                        supportBefore.WriteLine("for (int i = 0; i < {0}; i++)", array.Size);
+                        if (@class != null && @class.IsRefType)
+                            supportBefore.WriteLineIndent(
+                                "{0}[i * sizeof({2}.Internal)] = *((byte*)({2}.Internal*){1}[i].__Instance);",
+                                Context.ReturnVarName, Context.ArgName, array.Type);
+                        else
+                            supportBefore.WriteLineIndent("{0}[i] = {1}[i]{2};",
+                                Context.ReturnVarName, Context.ArgName,
+                                array.Type.IsPointerToPrimitiveType(PrimitiveType.Void)
+                                    ? ".ToPointer()"
+                                    : string.Empty);
+                        supportBefore.WriteCloseBraceIndent();
+                    }
                     break;
                 default:
                     Context.Return.Write("null");
@@ -397,11 +436,18 @@ namespace CppSharp.Generators.CSharp
             return true;
         }
 
+        private void ThrowArgumentOutOfRangeException()
+        {
+            Context.SupportBefore.WriteLineIndent(
+                "throw new ArgumentOutOfRangeException(\"{0}\", " +
+                "\"The dimensions of the provided array don't match the required size.\");",
+                Context.Parameter.Name);
+        }
+
         public bool VisitDelegateType(FunctionType function, string type)
         {
-            Context.Return.Write("Marshal.GetFunctionPointerForDelegate({0})",
-                Context.Parameter.Name);
-
+            Context.Return.Write("{0} == null ? global::System.IntPtr.Zero : Marshal.GetFunctionPointerForDelegate({0})",
+                  Context.Parameter.Name);
             return true;
         }
 
@@ -410,16 +456,40 @@ namespace CppSharp.Generators.CSharp
             if (!VisitType(pointer, quals))
                 return false;
 
-            var pointee = pointer.Pointee.Desugar();
-
-            if ((pointee.IsPrimitiveType(PrimitiveType.Char) ||
-                pointee.IsPrimitiveType(PrimitiveType.WideChar)) &&
-                pointer.QualifiedPointee.Qualifiers.IsConst)
+            if (Context.Function != null && pointer.IsPrimitiveTypeConvertibleToRef())
             {
-                Context.Return.Write(MarshalStringToUnmanaged(
-                    Helpers.SafeIdentifier(Context.Parameter.Name)));
-                CSharpContext.Cleanup.WriteLine("Marshal.FreeHGlobal({0});",
-                    Helpers.SafeIdentifier(Context.ArgName));
+                var refParamPtr = string.Format("__refParamPtr{0}", Context.ParameterIndex);
+                Context.SupportBefore.WriteLine("fixed ({0} {1} = &{2})",
+                    pointer, refParamPtr, Context.Parameter.Name);
+                Context.HasFixedBlock = true;
+                Context.SupportBefore.WriteStartBraceIndent();
+                Context.Return.Write(refParamPtr);
+                return true;
+            }
+
+            var param = Context.Parameter;
+            var isRefParam = param != null && (param.IsInOut || param.IsOut);
+
+            var pointee = pointer.Pointee.Desugar();
+            bool marshalPointeeAsString = CSharpTypePrinter.IsConstCharString(pointee) && isRefParam;
+
+            if (CSharpTypePrinter.IsConstCharString(pointer) || marshalPointeeAsString)
+            {
+                if (param.IsOut)
+                {
+                    Context.Return.Write("IntPtr.Zero");
+                    Context.ArgumentPrefix.Write("&");
+                }
+                else if (param.IsInOut)
+                {
+                    Context.Return.Write(MarshalStringToUnmanaged(Context.Parameter.Name));
+                    Context.ArgumentPrefix.Write("&");
+                }
+                else
+                {
+                    Context.Return.Write(MarshalStringToUnmanaged(Context.Parameter.Name));
+                    Context.Cleanup.WriteLine("Marshal.FreeHGlobal({0});", Context.ArgName);
+                }
                 return true;
             }
 
@@ -430,7 +500,7 @@ namespace CppSharp.Generators.CSharp
             }
 
             Class @class;
-            if (pointee.IsTagDecl(out @class) && @class.IsValueType)
+            if (pointee.TryGetClass(out @class) && @class.IsValueType)
             {
                 if (Context.Parameter.Usage == ParameterUsage.Out)
                 {
@@ -439,9 +509,10 @@ namespace CppSharp.Generators.CSharp
                 }
                 else
                 {
-                    Context.SupportBefore.WriteLine("var {0} = {1}.ToInternal();",
+                    Context.SupportBefore.WriteLine("var {0} = {1}.{2};",
                             Generator.GeneratedIdentifier(Context.ArgName),
-                            Helpers.SafeIdentifier(Context.Parameter.Name));
+                            Context.Parameter.Name,
+                            Helpers.InstanceIdentifier);
                 }
 
                 Context.Return.Write("new global::System.IntPtr(&{0})",
@@ -449,26 +520,35 @@ namespace CppSharp.Generators.CSharp
                 return true;
             }
 
+            var finalPointee = pointer.GetFinalPointee();
             PrimitiveType primitive;
-            if (pointee.IsPrimitiveType(out primitive))
+            if (finalPointee.IsPrimitiveType(out primitive) || finalPointee.IsEnumType())
             {
-                var param = Context.Parameter;
-
                 // From MSDN: "note that a ref or out parameter is classified as a moveable
                 // variable". This means we must create a local variable to hold the result
                 // and then assign this value to the parameter.
 
-                if (param.IsOut || param.IsInOut)
+                if (isRefParam)
                 {
-                    var typeName = Type.TypePrinterDelegate(pointee);
+                    var typeName = Type.TypePrinterDelegate(finalPointee);
 
-                    Context.SupportBefore.WriteLine("{0} _{1};", typeName,
-                        Helpers.SafeIdentifier(param.Name));
+                    if (param.IsInOut)
+                        Context.SupportBefore.WriteLine("{0} _{1} = {1};", typeName, param.Name);
+                    else
+                        Context.SupportBefore.WriteLine("{0} _{1};", typeName, param.Name);
+
                     Context.Return.Write("&_{0}", param.Name);
-
                 }
                 else
+                {
+                    if (Context.Driver.Options.MarshalCharAsManagedChar && primitive == PrimitiveType.Char)
+                    {
+                        var typePrinter = new CSharpTypePrinter(Context.Driver);
+                        typePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+                        Context.Return.Write(string.Format("({0}) ", pointer.Visit(typePrinter)));
+                    }
                     Context.Return.Write(Context.Parameter.Name);
+                }
 
                 return true;
             }
@@ -497,24 +577,25 @@ namespace CppSharp.Generators.CSharp
             {
                 case PrimitiveType.Void:
                     return true;
+                case PrimitiveType.Char:
+                    // returned structs must be blittable and char isn't
+                    if (Context.Driver.Options.MarshalCharAsManagedChar)
+                        Context.Return.Write("(sbyte) ");
+                    goto default;
+                case PrimitiveType.Char16:
+                    return false;
                 case PrimitiveType.Bool:
-                case PrimitiveType.Int8:
-                case PrimitiveType.UInt8:
-                case PrimitiveType.Int16:
-                case PrimitiveType.UInt16:
-                case PrimitiveType.Int32:
-                case PrimitiveType.UInt32:
-                case PrimitiveType.Int64:
-                case PrimitiveType.UInt64:
-                case PrimitiveType.Float:
-                case PrimitiveType.Double:
+                    if (Context.Kind == CSharpMarshalKind.NativeField)
+                    {
+                        // returned structs must be blittable and bool isn't
+                        Context.Return.Write("(byte) ({0} ? 1 : 0)", Context.Parameter.Name);
+                        return true;
+                    }
+                    goto default;
+                default:
                     Context.Return.Write(Context.Parameter.Name);
                     return true;
-                case PrimitiveType.WideChar:
-                    return false;
             }
-
-            return false;
         }
 
         public override bool VisitTypedefType(TypedefType typedef, TypeQualifiers quals)
@@ -525,7 +606,7 @@ namespace CppSharp.Generators.CSharp
             var decl = typedef.Declaration;
 
             FunctionType func;
-            if (decl.Type.IsPointerTo<FunctionType>(out func))
+            if (decl.Type.IsPointerTo(out func))
             {
                 VisitDelegateType(func, typedef.Declaration.OriginalName);
                 return true;
@@ -547,7 +628,7 @@ namespace CppSharp.Generators.CSharp
 
             if (@class.IsValueType)
             {
-                MarshalValueClass(@class);
+                MarshalValueClass();
             }
             else
             {
@@ -568,15 +649,19 @@ namespace CppSharp.Generators.CSharp
                 return;
             }
 
-            string param = Helpers.SafeIdentifier(Context.Parameter.Name);
+            string param = Context.Parameter.Name;
             Type type = Context.Parameter.Type.Desugar();
             if (type.IsAddress())
             {
                 Class decl;
-                if (type.IsTagDecl(out decl) && decl.IsValueType)
+                if (type.TryGetClass(out decl) && decl.IsValueType)
                     Context.Return.Write("{0}.{1}", param, Helpers.InstanceIdentifier);
                 else
-                    Context.Return.Write("{0} == ({2}) null ? global::System.IntPtr.Zero : {0}.{1}", param,
+                    Context.Return.Write("{0}{1}.{2}",
+                        method != null && method.OperatorKind == CXXOperatorKind.EqualEqual
+                            ? string.Empty
+                            : string.Format("ReferenceEquals({0}, null) ? global::System.IntPtr.Zero : ", param),
+                        param,
                         Helpers.InstanceIdentifier, type);
                 return;
             }
@@ -584,13 +669,13 @@ namespace CppSharp.Generators.CSharp
             var qualifiedIdentifier = CSharpMarshalNativeToManagedPrinter.QualifiedIdentifier(
                 @class.OriginalClass ?? @class);
             Context.Return.Write(
-                "{1} == ({0}) null ? new {0}.Internal() : *({0}.Internal*) ({1}.{2})", qualifiedIdentifier,
-                param, Helpers.InstanceIdentifier);
+                "ReferenceEquals({0}, null) ? new {1}.Internal() : *({1}.Internal*) ({0}.{2})", param,
+                qualifiedIdentifier, Helpers.InstanceIdentifier);
         }
 
-        private void MarshalValueClass(Class @class)
+        private void MarshalValueClass()
         {
-            Context.Return.Write("{0}.ToInternal()", Helpers.SafeIdentifier(Context.Parameter.Name));
+            Context.Return.Write("{0}.{1}", Context.Parameter.Name, Helpers.InstanceIdentifier);
         }
 
         public override bool VisitFieldDecl(Field field)
@@ -605,6 +690,20 @@ namespace CppSharp.Generators.CSharp
             };
 
             return field.Type.Visit(this, field.QualifiedType.Qualifiers);
+        }
+
+        public override bool VisitProperty(Property property)
+        {
+            if (!VisitDeclaration(property))
+                return false;
+
+            Context.Parameter = new Parameter
+            {
+                Name = Context.ArgName,
+                QualifiedType = property.QualifiedType
+            };
+
+            return base.VisitProperty(property);
         }
 
         public override bool VisitEnumDecl(Enumeration @enum)
@@ -629,7 +728,7 @@ namespace CppSharp.Generators.CSharp
         public static void CSharpMarshalToNative(this QualifiedType type,
             CSharpMarshalManagedToNativePrinter printer)
         {
-            (printer.Context as CSharpMarshalContext).FullType = type;
+            printer.Context.FullType = type;
             type.Visit(printer);
         }
 
@@ -648,7 +747,7 @@ namespace CppSharp.Generators.CSharp
         public static void CSharpMarshalToManaged(this QualifiedType type,
             CSharpMarshalNativeToManagedPrinter printer)
         {
-            (printer.Context as CSharpMarshalContext).FullType = type;
+            printer.Context.FullType = type;
             type.Visit(printer);
         }
 

@@ -1,4 +1,5 @@
 ﻿using CppSharp.AST;
+using CppSharp.AST.Extensions;
 
 namespace CppSharp.Passes
 {
@@ -151,6 +152,11 @@ namespace CppSharp.Passes
             return false;
         }
 
+        public bool VisitPackExpansionType(PackExpansionType packExpansionType, TypeQualifiers quals)
+        {
+            return true;
+        }
+
         public bool VisitCILType(CILType type, TypeQualifiers quals)
         {
             return false;
@@ -227,6 +233,11 @@ namespace CppSharp.Passes
         }
 
         public bool VisitProperty(Property property)
+        {
+            return false;
+        }
+
+        public bool VisitFriend(Friend friend)
         {
             return false;
         }

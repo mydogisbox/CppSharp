@@ -1,31 +1,9 @@
 ﻿using CppSharp.AST;
+using CppSharp.AST.Extensions;
 using CppSharp.Types;
 
 namespace CppSharp
 {
-    /// <summary>
-    /// This type checker is used to check if a type is complete.
-    /// </summary>
-    public class TypeCompletionChecker : AstVisitor
-    {
-        public TypeCompletionChecker()
-        {
-            Options.VisitClassBases = false;
-            Options.VisitTemplateArguments = false;
-        }
-
-        public override bool VisitDeclaration(Declaration decl)
-        {
-            if (AlreadyVisited(decl))
-                return false;
-
-            if (decl.CompleteDeclaration != null)
-                return true;
-
-            return !decl.IsIncomplete;
-        }
-    }
-
     /// <summary>
     /// This type checker is used to check if a type is ignored.
     /// </summary>
@@ -54,7 +32,7 @@ namespace CppSharp
             if (decl.CompleteDeclaration != null)
                 return VisitDeclaration(decl.CompleteDeclaration);
 
-            if (decl.Ignore)
+            if (decl.GenerationKind == GenerationKind.None)
             {
                 Ignore();
                 return false;
@@ -100,17 +78,21 @@ namespace CppSharp
             return base.VisitTypedefDecl(typedef);
         }
 
-        public override bool VisitMemberPointerType(MemberPointerType member,
-            TypeQualifiers quals)
+        public override bool VisitMemberPointerType(MemberPointerType member, TypeQualifiers quals)
         {
-            FunctionType functionType;
-            if (!member.IsPointerTo(out functionType))
+            Ignore();
+            return false;
+        }
+
+        public override bool VisitParameterDecl(Parameter parameter)
+        {
+            if (parameter.Type.IsPrimitiveType(PrimitiveType.Null))
             {
                 Ignore();
                 return false;
             }
 
-            return base.VisitMemberPointerType(member, quals);
+            return base.VisitParameterDecl(parameter);
         }
 
         public override bool VisitTemplateSpecializationType(

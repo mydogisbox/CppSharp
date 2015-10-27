@@ -7,6 +7,8 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Util;
 using CppSharp.AST;
+using CppSharp.AST.Extensions;
+using CppSharp.Types;
 using CppSharp.Utils;
 using Attribute = CppSharp.AST.Attribute;
 using Type = CppSharp.AST.Type;
@@ -16,7 +18,7 @@ namespace CppSharp.Generators.CSharp
     public static class Helpers
     {
         // from https://github.com/mono/mono/blob/master/mcs/class/System/Microsoft.CSharp/CSharpCodeGenerator.cs
-        private static readonly string[] Keywords = new string[]
+        private static readonly string[] Keywords =
             {
                 "abstract", "event", "new", "struct", "as", "explicit", "null", "switch",
                 "base", "extern", "this", "false", "operator", "throw", "break", "finally",
@@ -33,39 +35,29 @@ namespace CppSharp.Generators.CSharp
 
         public static string SafeIdentifier(string id)
         {
-            id = new string(id.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
-            return Keywords.Contains(id) ? "@" + id : id;
+            if (id.All(char.IsLetterOrDigit))
+                return Keywords.Contains(id) ? "@" + id : id;
+            return new string(id.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
         }
 
-        public static string ToCSharpCallConv(CallingConvention convention)
-        {
-            switch (convention)
-            {
-                case CallingConvention.Default:
-                    return "Winapi";
-                case CallingConvention.C:
-                    return "Cdecl";
-                case CallingConvention.StdCall:
-                    return "StdCall";
-                case CallingConvention.ThisCall:
-                    return "ThisCall";
-                case CallingConvention.FastCall:
-                    return "FastCall";
-            }
+        public static readonly string InstanceField = Generator.GeneratedIdentifier("instance");
+        public static readonly string InstanceIdentifier = Generator.GeneratedIdentifier("Instance");
+        public static readonly string PointerAdjustmentIdentifier = Generator.GeneratedIdentifier("PointerAdjustment");
+        public static readonly string ReturnIdentifier = Generator.GeneratedIdentifier("ret");
+        public static readonly string DummyIdentifier = Generator.GeneratedIdentifier("dummy");
+        public static readonly string TargetIdentifier = Generator.GeneratedIdentifier("target");
+        public static readonly string SlotIdentifier = Generator.GeneratedIdentifier("slot");
 
-            return "Winapi";
-        }
+        public static readonly string OwnsNativeInstanceIdentifier = Generator.GeneratedIdentifier("ownsNativeInstance");
 
-        public static string InstanceIdentifier
-        {
-            get { return Generator.GeneratedIdentifier("Instance"); }
-        }
+        public static readonly string CreateInstanceIdentifier = Generator.GeneratedIdentifier("CreateInstance");
 
         public static string GetAccess(AccessSpecifier accessSpecifier)
         {
             switch (accessSpecifier)
             {
                 case AccessSpecifier.Private:
+                case AccessSpecifier.Internal:
                     return "internal ";
                 case AccessSpecifier.Protected:
                     return "protected ";
@@ -96,25 +88,45 @@ namespace CppSharp.Generators.CSharp
         public const int VTableDelegate = FIRST + 16;
         public const int Region = FIRST + 17;
         public const int Interface = FIRST + 18;
+        public const int Finalizer = FIRST + 19;
     }
 
     public class CSharpTextTemplate : Template
     {
         public CSharpTypePrinter TypePrinter { get; private set; }
+        public CSharpExpressionPrinter ExpressionPrinter { get; private set; }
 
         public override string FileExtension
         {
             get { return "cs"; }
         }
 
-        public CSharpTextTemplate(Driver driver, TranslationUnit unit,
-            CSharpTypePrinter typePrinter)
-            : base(driver, unit)
+        public CSharpTextTemplate(Driver driver, IEnumerable<TranslationUnit> units,
+            CSharpTypePrinter typePrinter, CSharpExpressionPrinter expressionPrinter)
+            : base(driver, units)
         {
             TypePrinter = typePrinter;
+            ExpressionPrinter = expressionPrinter;
         }
 
         #region Identifiers
+
+        // Takes a declaration (type, class etc.) that is referenced from a context, and the context.
+        // If the referenced name needs a qualification in the context, add it. Otherwise, return just the name.
+        private static string QualifiedIdentifierIfNeeded(Declaration reference)
+        {
+            var refNames = new Stack<string>();
+
+            var refCtx = reference;
+            while (refCtx != null)
+            {
+                if (!string.IsNullOrWhiteSpace(refCtx.Name))
+                    refNames.Push(refCtx.Name);
+                refCtx = refCtx.Namespace;
+            }
+
+            return string.Join(".", refNames);
+        }
 
         public string QualifiedIdentifier(Declaration decl)
         {
@@ -128,7 +140,7 @@ namespace CppSharp.Generators.CSharp
                 ctx = ctx.Namespace;
             }
 
-            if (Options.GenerateLibraryNamespace)
+            if (decl.GenerationKind == GenerationKind.Generate && Options.GenerateLibraryNamespace)
                 names.Add(Options.OutputNamespace);
 
             names.Reverse();
@@ -138,11 +150,6 @@ namespace CppSharp.Generators.CSharp
         public static string GeneratedIdentifier(string id)
         {
             return Generator.GeneratedIdentifier(id);
-        }
-
-        public static string SafeIdentifier(string id)
-        {
-            return Helpers.SafeIdentifier(id);
         }
 
         #endregion
@@ -155,16 +162,23 @@ namespace CppSharp.Generators.CSharp
             WriteLine("using System;");
             WriteLine("using System.Runtime.InteropServices;");
             WriteLine("using System.Security;");
+            foreach (var customUsingStatement in Options.DependentNameSpaces)
+            {
+                WriteLine(string.Format("using {0};", customUsingStatement));
+            }
             PopBlock(NewLineKind.BeforeNextBlock);
 
             if (Options.GenerateLibraryNamespace)
             {
                 PushBlock(CSharpBlockKind.Namespace);
-                WriteLine("namespace {0}", SafeIdentifier(Driver.Options.OutputNamespace));
+                WriteLine("namespace {0}", Driver.Options.OutputNamespace);
                 WriteStartBraceIndent();
             }
 
-            GenerateDeclContext(TranslationUnit);
+            foreach (var unit in TranslationUnits)
+            {
+                GenerateDeclContext(unit);
+            }
 
             if (Options.GenerateLibraryNamespace)
             {
@@ -200,7 +214,7 @@ namespace CppSharp.Generators.CSharp
             // Generate all the enum declarations.
             foreach (var @enum in context.Enums)
             {
-                if (@enum.Ignore || @enum.IsIncomplete)
+                if (!@enum.IsGenerated || @enum.IsIncomplete)
                     continue;
 
                 GenerateEnum(@enum);
@@ -209,18 +223,13 @@ namespace CppSharp.Generators.CSharp
             // Generate all the typedef declarations.
             foreach (var typedef in context.Typedefs)
             {
-                if (typedef.Ignore) continue;
-
                 GenerateTypedef(typedef);
             }
 
             // Generate all the struct/class declarations.
             foreach (var @class in context.Classes)
             {
-                if (@class.Ignore || @class.IsIncomplete)
-                    continue;
-
-                if (@class.IsDependent)
+                if (@class.IsIncomplete)
                     continue;
 
                 if (@class.IsInterface)
@@ -232,8 +241,8 @@ namespace CppSharp.Generators.CSharp
             if (context.HasFunctions)
             {
                 PushBlock(CSharpBlockKind.Functions);
-                WriteLine("public unsafe partial class {0}{1}", SafeIdentifier(Options.OutputNamespace),
-                    TranslationUnit.FileNameWithoutExtension);
+                WriteLine("public unsafe partial class {0}",
+                    context.TranslationUnit.FileNameWithoutExtension);
                 WriteStartBraceIndent();
 
                 PushBlock(CSharpBlockKind.InternalsClass);
@@ -243,7 +252,7 @@ namespace CppSharp.Generators.CSharp
                 // Generate all the internal function declarations.
                 foreach (var function in context.Functions)
                 {
-                    if (function.Ignore) continue;
+                    if ((!function.IsGenerated && !function.IsInternal) || function.IsSynthetized) continue;
 
                     GenerateInternalFunction(function);
                 }
@@ -253,7 +262,7 @@ namespace CppSharp.Generators.CSharp
 
                 foreach (var function in context.Functions)
                 {
-                    if (function.Ignore) continue;
+                    if (!function.IsGenerated) continue;
 
                     GenerateFunction(function);
                 }
@@ -264,7 +273,7 @@ namespace CppSharp.Generators.CSharp
 
             foreach (var @event in context.Events)
             {
-                if (@event.Ignore) continue;
+                if (!@event.IsGenerated) continue;
 
                 GenerateEvent(@event);
             }
@@ -292,31 +301,31 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateDebug(Declaration decl)
         {
-            if (Options.OutputDebug && !String.IsNullOrWhiteSpace(decl.DebugText))
+            if (Options.OutputDebug && !string.IsNullOrWhiteSpace(decl.DebugText))
                 WriteLine("// DEBUG: " + decl.DebugText);
         }
 
         public void GenerateComment(RawComment comment)
         {
-            if (string.IsNullOrWhiteSpace(comment.BriefText))
-                return;
-
-            PushBlock(BlockKind.BlockComment);
-            WriteLine("/// <summary>");
-            foreach (string line in HtmlEncoder.HtmlEncode(comment.BriefText).Split(
-                                        Environment.NewLine.ToCharArray()))
-                WriteLine("/// <para>{0}</para>", line);
-            WriteLine("/// </summary>");
-
-            if (!string.IsNullOrWhiteSpace(comment.Text))
+            if (comment.FullComment != null)
             {
-                WriteLine("/// <remarks>");
-                foreach (string line in HtmlEncoder.HtmlEncode(comment.Text).Split(
-                                            Environment.NewLine.ToCharArray()))
-                    WriteLine("/// <para>{0}</para>", line);
-                WriteLine("/// </remarks>");
+                PushBlock(BlockKind.BlockComment);
+                WriteLine(comment.FullComment.CommentToString());
+                PopBlock();
             }
-            PopBlock();
+            else
+            {
+                if (string.IsNullOrWhiteSpace(comment.BriefText))
+                    return;
+
+                PushBlock(BlockKind.BlockComment);
+                WriteLine("<summary>");
+                foreach (string line in HtmlEncoder.HtmlEncode(comment.BriefText).Split(
+                                            Environment.NewLine.ToCharArray()))
+                    WriteLine("<para>{0}</para>", line);
+                WriteLine("</summary>");
+                PopBlock();
+            }
         }
 
         public void GenerateInlineSummary(RawComment comment)
@@ -327,7 +336,18 @@ namespace CppSharp.Generators.CSharp
                 return;
 
             PushBlock(BlockKind.InlineComment);
-            WriteLine("/// <summary>{0}</summary>", comment.BriefText);
+            if (comment.BriefText.Contains("\n"))
+            {
+                WriteLine("{0} <summary>", Options.CommentPrefix);
+                foreach (string line in HtmlEncoder.HtmlEncode(comment.BriefText).Split(
+                                            Environment.NewLine.ToCharArray()))
+                    WriteLine("{0} <para>{1}</para>", Options.CommentPrefix, line);
+                WriteLine("{0} </summary>", Options.CommentPrefix);
+            }
+            else
+            {
+                WriteLine("{0} <summary>{1}</summary>", Options.CommentPrefix, comment.BriefText);
+            }
             PopBlock();
         }
 
@@ -335,8 +355,16 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateClass(Class @class)
         {
-            if (@class.Ignore || @class.IsIncomplete)
+            if (@class.IsIncomplete)
                 return;
+
+            System.Type typeMap = null;
+            if (Driver.TypeDatabase.TypeMaps.ContainsKey(@class.Name))
+            {
+                typeMap = Driver.TypeDatabase.TypeMaps[@class.Name];
+                // disable the type map for the mapped class itself so that operator params are not mapped
+                Driver.TypeDatabase.TypeMaps.Remove(@class.Name);
+            }
 
             PushBlock(CSharpBlockKind.Class);
             GenerateDeclarationCommon(@class);
@@ -348,34 +376,63 @@ namespace CppSharp.Generators.CSharp
 
             if (!@class.IsOpaque)
             {
-                GenerateClassInternals(@class);
-
+                if (!@class.IsAbstractImpl)
+                    GenerateClassInternals(@class);
                 GenerateDeclContext(@class);
+
+                if (@class.IsDependent || !@class.IsGenerated)
+                    goto exit;
 
                 if (ShouldGenerateClassNativeField(@class))
                 {
                     PushBlock(CSharpBlockKind.Field);
-                    WriteLine("public global::System.IntPtr {0} {{ get; {1} set; }}",
-                        Helpers.InstanceIdentifier, @class.IsValueType ? "private" : "protected");
+                    if (@class.IsValueType)
+                    {
+                        WriteLine("private {0}.Internal {1};", @class.Name, Helpers.InstanceField);
+                        WriteLine("public {0}.Internal {1} {{ get {{ return {2}; }} }}", @class.Name,
+                            Helpers.InstanceIdentifier, Helpers.InstanceField);
+                    }
+                    else
+                    {
+                        WriteLine("public {0} {1} {{ get; protected set; }}",
+                            "global::System.IntPtr", Helpers.InstanceIdentifier);
+
+                        PopBlock(NewLineKind.BeforeNextBlock);
+
+                        PushBlock(CSharpBlockKind.Field);
+
+                        WriteLine("protected int {0};", Helpers.PointerAdjustmentIdentifier);
+
+                        // use interfaces if any - derived types with a secondary base this class must be compatible with the map
+                        var @interface = @class.Namespace.Classes.Find(c => c.OriginalClass == @class);
+                        WriteLine(
+                            "public static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, {0}> NativeToManagedMap = new System.Collections.Concurrent.ConcurrentDictionary<IntPtr, {0}>();",
+                            @interface != null ? @interface.Name : @class.Name);
+                        WriteLine("protected void*[] __OriginalVTables;");
+                    }
                     PopBlock(NewLineKind.BeforeNextBlock);
                 }
 
-                GenerateClassMarshals(@class);
+                if (Options.GenerateClassMarshals)
+                {
+                    GenerateClassMarshals(@class);
+                }
+
                 GenerateClassConstructors(@class);
 
-                if (@class.IsValueType)
-                    GenerateValueClassFields(@class);
-
-                GenerateClassMethods(@class);
+                GenerateClassMethods(@class.Methods);
                 GenerateClassVariables(@class);
                 GenerateClassProperties(@class);
 
-                if (Options.GenerateVirtualTables && @class.IsDynamic)
+                if (@class.IsDynamic)
                     GenerateVTable(@class);
             }
-
+        exit:
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
+
+            if (typeMap != null)
+                Driver.TypeDatabase.TypeMaps.Add(@class.Name, typeMap);
         }
 
         private void GenerateClassMarshals(Class @class)
@@ -399,7 +456,7 @@ namespace CppSharp.Generators.CSharp
 
         private void GenerateInterface(Class @class)
         {
-            if (@class.Ignore || @class.IsIncomplete)
+            if (!@class.IsGenerated || @class.IsIncomplete)
                 return;
 
             PushBlock(CSharpBlockKind.Interface);
@@ -410,10 +467,8 @@ namespace CppSharp.Generators.CSharp
             NewLine();
             WriteStartBraceIndent();
 
-            GenerateDeclContext(@class);
-
-            foreach (var method in @class.Methods.Where(m => !ASTUtils.CheckIgnoreMethod(m) &&
-                                                             m.Access == AccessSpecifier.Public))
+            foreach (var method in @class.Methods.Where(m =>
+                !ASTUtils.CheckIgnoreMethod(m, Options) && m.Access == AccessSpecifier.Public))
             {
                 PushBlock(CSharpBlockKind.Method);
                 GenerateDeclarationCommon(method);
@@ -428,12 +483,13 @@ namespace CppSharp.Generators.CSharp
 
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
-            foreach (var prop in @class.Properties.Where(p => !p.Ignore))
+            foreach (var prop in @class.Properties.Where(p => p.IsGenerated && p.Access == AccessSpecifier.Public))
             {
                 PushBlock(CSharpBlockKind.Property);
                 var type = prop.Type;
                 if (prop.Parameters.Count > 0 && prop.Type.IsPointerToPrimitiveType())
                     type = ((PointerType) prop.Type).Pointee;
+                GenerateDeclarationCommon(prop);
                 Write("{0} {1} {{ ", type, GetPropertyName(prop));
                 if (prop.HasGetter)
                     Write("get; ");
@@ -448,30 +504,6 @@ namespace CppSharp.Generators.CSharp
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        private void GenerateValueClassFields(Class @class)
-        {
-            GenerateClassFields(@class, field =>
-            {
-                var fieldClass = (Class) field.Namespace;
-                if (!fieldClass.IsValueType)
-                    return;
-                GenerateClassField(field);
-            });
-        }
-
-        public void GenerateClassInternalsFields(Class @class)
-        {
-            GenerateClassFields(@class, GenerateClassInternalsField);
-
-            foreach (var prop in @class.Properties)
-            {
-                if (prop.Ignore || prop.Field == null)
-                    continue;
-
-                GenerateClassInternalsField(prop.Field);
-            }
-        }
-
         public void GenerateClassInternals(Class @class)
         {
             PushBlock(CSharpBlockKind.InternalsClass);
@@ -481,58 +513,70 @@ namespace CppSharp.Generators.CSharp
             GenerateClassInternalHead(@class);
             WriteStartBraceIndent();
 
-            var typePrinter = TypePrinter as CSharpTypePrinter;
-            typePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+            TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
 
-            GenerateClassInternalsFields(@class);
-            GenerateVTablePointers(@class);
-
-            var functions = GatherClassInternalFunctions(@class);
-
-            foreach (var function in functions)
+            GenerateClassFields(@class, @class, GenerateClassInternalsField, true);
+            if (@class.IsGenerated)
             {
-                GenerateInternalFunction(function);
+                if (@class.IsDynamic)
+                    GenerateVTablePointers(@class);
+
+                var functions = GatherClassInternalFunctions(@class);
+
+                foreach (var function in functions)
+                    GenerateInternalFunction(function);
             }
 
-            typePrinter.PopContext();
+            TypePrinter.PopContext();
 
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        private static ISet<Function> GatherClassInternalFunctions(Class @class)
+        private IEnumerable<Function> GatherClassInternalFunctions(Class @class,
+            bool includeCtors = true)
         {
-            var functions = new HashSet<Function>();
+            var functions = new List<Function>();
+            if (@class.IsValueType)
+                foreach (var @base in @class.Bases.Where(b => b.IsClass && !b.Class.Ignore))
+                    functions.AddRange(GatherClassInternalFunctions(@base.Class, false));
 
             Action<Method> tryAddOverload = method =>
             {
-                if (method.IsSynthetized)
+                if (method.IsSynthetized &&
+                    method.SynthKind != FunctionSynthKind.AdjustedMethod)
                     return;
 
-                if (method.IsProxy)
+                if (method.IsProxy || (method.IsVirtual && !method.IsOperator))
                     return;
 
                 functions.Add(method);
             };
 
-            foreach (var ctor in @class.Constructors)
+            if (includeCtors)
             {
-                if (ctor.IsMoveConstructor)
-                    continue;
+                foreach (var ctor in @class.Constructors)
+                {
+                    if (@class.IsStatic || ctor.IsMoveConstructor)
+                        continue;
 
-                if (ctor.IsDefaultConstructor && !@class.HasNonTrivialDefaultConstructor)
-                    continue;
+                    if (!ctor.IsGenerated)
+                        continue;
 
-                tryAddOverload(ctor);
+                    if (ctor.IsDefaultConstructor && !@class.HasNonTrivialDefaultConstructor)
+                        continue;
+
+                    tryAddOverload(ctor);
+                }
             }
 
-            if (@class.HasNonTrivialDestructor)
+            if (@class.HasNonTrivialDestructor && !@class.IsStatic)
                 foreach (var dtor in @class.Destructors)
                     tryAddOverload(dtor);
 
             foreach (var method in @class.Methods)
             {
-                if (ASTUtils.CheckIgnoreMethod(method))
+                if (ASTUtils.CheckIgnoreMethod(method, Options))
                     continue;
 
                 if (method.IsConstructor)
@@ -546,48 +590,88 @@ namespace CppSharp.Generators.CSharp
                 if (prop.GetMethod != null)
                     tryAddOverload(prop.GetMethod);
 
-                if (prop.SetMethod != null)
+                if (prop.SetMethod != null && prop.SetMethod != prop.GetMethod)
                     tryAddOverload(prop.SetMethod);
             }
 
             return functions;
         }
 
-        List<string> GatherInternalParams(Function function, out CSharpTypePrinterResult retType)
+        private IEnumerable<Parameter> GatherInternalParams(Function function, bool useOriginalParamNames = true)
         {
-            var @params = new List<string>();
-
-            TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
-
-            var retParam = new Parameter { QualifiedType = function.OriginalReturnType };
-            retType = retParam.CSharpType(TypePrinter);
+            var @params = new List<Parameter>();
 
             var method = function as Method;
-            if (method != null && !method.IsStatic)
-            {
-                @params.Add("global::System.IntPtr instance");
+            var isInstanceMethod = method != null && !method.IsStatic;
 
-                if (method.IsConstructor && base.Options.IsMicrosoftAbi)
-                    retType = "global::System.IntPtr";
+            var pointer = new QualifiedType(new PointerType(new QualifiedType(new BuiltinType(PrimitiveType.Void))));
+
+            if (isInstanceMethod && Options.IsMicrosoftAbi)
+            {
+                @params.Add(new Parameter
+                {
+                    QualifiedType = pointer,
+                    Name = "instance"
+                });
             }
 
-            foreach (var param in function.Parameters)
+            if (!function.HasIndirectReturnTypeParameter &&
+                isInstanceMethod && Options.IsItaniumLikeAbi)
             {
-                if (param.Kind == ParameterKind.OperatorParameter)
-                    continue;
+                @params.Add(new Parameter
+                {
+                    QualifiedType = pointer,
+                    Name = "instance"
+                });
+            }
 
-                var typeName = param.CSharpType(TypePrinter);
-                string paramName = param.IsSynthetized ?
-                    GeneratedIdentifier(param.Name) : SafeIdentifier(param.Name);
-                @params.Add(string.Format("{0} {1}", typeName, paramName));
+            var i = 0;
+            foreach (var param in function.Parameters.Where(p => p.Kind != ParameterKind.OperatorParameter))
+            {
+                @params.Add(new Parameter
+                {
+                    QualifiedType = param.QualifiedType,
+                    Kind = param.Kind,
+                    Usage = param.Usage,
+                    Name = useOriginalParamNames ? param.Name : "arg" + ++i
+                });
+
+                if (param.Kind == ParameterKind.IndirectReturnType &&
+                    isInstanceMethod && Options.IsItaniumLikeAbi)
+                {
+                    @params.Add(new Parameter
+                    {
+                        QualifiedType = pointer,
+                        Name = "instance"
+                    });
+                }
             }
 
             if (method != null && method.IsConstructor)
             {
                 var @class = (Class) method.Namespace;
                 if (Options.IsMicrosoftAbi && @class.Layout.HasVirtualBases)
-                    @params.Add("int " + CSharpTextTemplate.GeneratedIdentifier("forBases"));
+                {
+                    @params.Add(new Parameter
+                    {
+                        QualifiedType = new QualifiedType(new BuiltinType(PrimitiveType.Int)),
+                        Name = GeneratedIdentifier("forBases")
+                    });
+                }
             }
+
+            return @params;
+        }
+
+        private IEnumerable<string> GatherInternalParams(Function function, out CSharpTypePrinterResult retType)
+        {
+            TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+
+            var retParam = new Parameter { QualifiedType = function.ReturnType };
+            retType = retParam.CSharpType(TypePrinter);
+
+            var @params = GatherInternalParams(function).Select(p =>
+                string.Format("{0} {1}", p.CSharpType(TypePrinter), p.Name)).ToList();
 
             TypePrinter.PopContext();
 
@@ -598,214 +682,156 @@ namespace CppSharp.Generators.CSharp
         {
             Write("public ");
 
-            if (@class != null && @class.HasBaseClass)
+            if (@class != null && @class.NeedsBase && !@class.BaseClass.IsInterface)
                 Write("new ");
 
-            WriteLine("struct Internal");
+            WriteLine("partial struct Internal");
         }
 
-        private void GenerateStructMarshalingFields(Class @class)
+        public static bool ShouldGenerateClassNativeField(Class @class)
         {
-            foreach (var @base in @class.Bases)
-            {
-                if (!@base.IsClass || @base.Class.Ignore)
-                    continue;
-
-                GenerateStructMarshalingFields(@base.Class);
-            }
-
-            for (int i = 0; i < @class.Fields.Count; i++)
-            {
-                var field = @class.Fields[i];
-                if (ASTUtils.CheckIgnoreField(field)) continue;
-
-                var nativeField = string.Format("{0}->{1}",
-                    Generator.GeneratedIdentifier("ptr"), field.OriginalName);
-
-                var ctx = new CSharpMarshalContext(Driver)
-                {
-                    Kind = CSharpMarshalKind.NativeField,
-                    ArgName = field.Name,
-                    ReturnVarName = nativeField,
-                    ReturnType = field.QualifiedType
-                };
-
-                var marshal = new CSharpMarshalNativeToManagedPrinter(ctx) { VarSuffix = i };
-                field.Visit(marshal);
-
-                if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
-                    Write(marshal.Context.SupportBefore);
-
-                WriteLine("{0} = {1};", field.Name, marshal.Context.Return);
-            }
-        }
-
-        private void GenerateStructInternalMarshaling(Class @class)
-        {
-            var marshalVar = Generator.GeneratedIdentifier("native");
-
-            WriteLine("var {0} = new {1}.Internal();", marshalVar, QualifiedIdentifier(@class));
-            GenerateStructInternalMarshalingFields(@class, marshalVar);
-
-            WriteLine("return {0};", marshalVar);
-        }
-
-        private void GenerateStructInternalMarshalingFields(Class @class, string marshalVar)
-        {
-            foreach (var @base in @class.Bases)
-            {
-                if (!@base.IsClass || @base.Class.Ignore)
-                    continue;
-
-                var baseClass = @base.Class;
-                GenerateStructInternalMarshalingFields(baseClass, marshalVar);
-            }
-
-            foreach (var field in @class.Fields)
-            {
-                if (field.Ignore)
-                    continue;
-
-                GenerateStructInternalMarshalingField(field, marshalVar);
-            }
-        }
-
-        private void GenerateStructInternalMarshalingField(Field field, string marshalVar)
-        {
-            var marshalCtx = new CSharpMarshalContext(Driver)
-            {
-                ArgName = field.Name,
-            };
-
-            var marshal = new CSharpMarshalManagedToNativePrinter(marshalCtx);
-            field.Visit(marshal);
-
-            Type type;
-            Class @class;
-            var isRef = field.Type.IsPointerTo(out type) &&
-                !(type.IsTagDecl(out @class) && @class.IsValueType) &&
-                !type.IsPrimitiveType();
-
-            if (isRef)
-            {
-                WriteLine("if ({0} != null)", field.Name);
-                WriteStartBraceIndent();
-            }
-
-            if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
-               WriteLine(marshal.Context.SupportBefore);
-
-           WriteLine("{0}.{1} = {2};", marshalVar, field.OriginalName, marshal.Context.Return);
-
-            if (isRef)
-                WriteCloseBraceIndent();
-        }
-
-        public bool ShouldGenerateClassNativeField(Class @class)
-        {
-            if (!@class.IsRefType)
+            if (@class.IsStatic)
                 return false;
-
-            Class baseClass = null;
-
-            if (@class.HasBaseClass)
-                baseClass = @class.Bases[0].Class;
-
-            var hasRefBase = baseClass != null && baseClass.IsRefType && !baseClass.Ignore;
-
-            var hasIgnoredBase = baseClass != null && baseClass.Ignore;
-
-            return !@class.HasBase || !hasRefBase || hasIgnoredBase;
+            return @class.IsValueType || !@class.HasBase || !@class.HasRefBase();
         }
 
         public void GenerateClassProlog(Class @class)
         {
-            if (@class.IsUnion)
-                WriteLine("[StructLayout(LayoutKind.Explicit)]");
-
-            Write(Helpers.GetAccess(@class.Access));
+            Write(@class.IsInternal ? "internal " : Helpers.GetAccess(@class.Access));
+            if (@class.Access == AccessSpecifier.Protected)
+                Write("internal ");
             Write("unsafe ");
 
-            if (Driver.Options.GenerateAbstractImpls && @class.IsAbstract)
+            if (@class.IsAbstract)
                 Write("abstract ");
 
+            if (@class.IsStatic)
+                Write("static ");
+
+            // This token needs to directly precede the "class" token.
             if (Options.GeneratePartialClasses)
                 Write("partial ");
 
             Write(@class.IsInterface ? "interface " : (@class.IsValueType ? "struct " : "class "));
-            Write("{0}", SafeIdentifier(@class.Name));
+            Write("{0}", @class.Name);
 
             var bases = new List<string>();
 
-            var needsBase = @class.HasBaseClass && !@class.IsValueType
-                && !@class.Bases[0].Class.IsValueType
-                && !@class.Bases[0].Class.Ignore;
-
-            if (needsBase)
+            if (@class.NeedsBase)
             {
                 bases.AddRange(
                     from @base in @class.Bases
                     where @base.IsClass
-                    select QualifiedIdentifier(@base.Class));
+                    select QualifiedIdentifierIfNeeded(@base.Class));
             }
 
-            if (@class.IsRefType)
-                bases.Add("IDisposable");
+            if (@class.IsGenerated)
+            {
+                if (@class.IsRefType)
+                    bases.Add("IDisposable");
 
-            bases.Add("CppSharp.Runtime.ICppMarshal");
+                if (Options.GenerateClassMarshals)
+                {
+                    bases.Add("CppSharp.Runtime.ICppMarshal");
+                }
+            }
 
-            if (bases.Count > 0)
+            if (bases.Count > 0 && !@class.IsStatic)
                 Write(" : {0}", string.Join(", ", bases));
         }
 
-        public void GenerateClassFields(Class @class, Action<Field> action)
+        public void GenerateClassFields(Class owner, Class @class,
+            Action<Class, Field> action, bool nativeFields = false)
         {
-            foreach (var @base in @class.Bases)
+            foreach (var @base in @class.Bases.Where(b => b.Class != null))
             {
-                if (!@base.IsClass) continue;
-                var baseClass = @base.Class;
-
-                if (baseClass.Ignore)
+                TypeMap typeMap;
+                if ((!Driver.TypeDatabase.FindTypeMap(@base.Type, out typeMap) && !@base.Class.IsDeclared) ||
+                    @base.Class.OriginalClass == @class)
                     continue;
 
-                GenerateClassFields(baseClass, action);
+                GenerateClassFields(owner, @base.Class, action, nativeFields);
             }
 
             foreach (var field in @class.Fields)
             {
-                if (ASTUtils.CheckIgnoreField(field)) continue;
-                action(field);
+                if (ASTUtils.CheckIgnoreField(field, nativeFields)) continue;
+                action(owner, field);
             }
         }
 
-        private void GenerateClassInternalsField(Field field)
+        private void GenerateClassInternalsField(Class owner, Field field)
         {
+            // we do not support dependent fields yet, see https://github.com/mono/CppSharp/issues/197
+            Class @class;
+            field.Type.TryGetClass(out @class);
+            if ((field.Type.IsDependent && !field.Type.IsPointer() &&
+                !(@class != null && @class.IsUnion)) || (@class != null && @class.TranslationUnit.IsSystemHeader))
+                return;
+
+            var safeIdentifier = Helpers.SafeIdentifier(field.InternalName);
+
+            if(safeIdentifier.All(c => c.Equals('_')))
+            {
+                safeIdentifier = Helpers.SafeIdentifier(field.Name);
+            }
+
             PushBlock(CSharpBlockKind.Field);
 
-            WriteLine("[FieldOffset({0})]", field.OffsetInBytes);
+            WriteLine("[FieldOffset({0})]", field.OffsetInBytes +
+                owner.ComputeNonVirtualBaseClassOffsetTo((Class) field.Namespace));
 
-            var result = field.QualifiedType.CSharpType(TypePrinter);
-            Write("public {0} {1}", result.Type, SafeIdentifier(field.OriginalName));
+            TypePrinter.PushMarshalKind(CSharpMarshalKind.NativeField);
+            var fieldTypePrinted = field.QualifiedType.CSharpType(TypePrinter);
+            TypePrinter.PopMarshalKind();
 
-            if (!string.IsNullOrWhiteSpace(result.NameSuffix))
-                Write(result.NameSuffix);
+            var typeName = safeIdentifier;
+            if (!string.IsNullOrWhiteSpace(fieldTypePrinted.NameSuffix))
+                typeName += fieldTypePrinted.NameSuffix;
 
-            WriteLine(";");
+            var access = @class != null && !@class.IsGenerated ? "internal" : "public";
+            if (field.Expression != null)
+            {
+                var fieldValuePrinted = field.Expression.CSharpValue(ExpressionPrinter);
+                Write("{0} {1} {2} = {3};", access, fieldTypePrinted.Type, typeName, fieldValuePrinted);
+            }
+            else
+            {
+                Write("{0} {1} {2};", access, fieldTypePrinted.Type, typeName);
+            }
 
             PopBlock(NewLineKind.BeforeNextBlock);
+
+            // Workaround a bug in Mono when handling fixed arrays in P/Invoke declarations.
+            // https://bugzilla.xamarin.com/show_bug.cgi?id=33571
+            var arrayType = field.Type.Desugar() as ArrayType;
+            if (arrayType != null && arrayType.SizeType == ArrayType.ArraySize.Constant &&
+                arrayType.Size > 0)
+            {
+                for (var i = 1; i < arrayType.Size; ++i)
+                {
+                    var dummy = new Field
+                    {
+                        Name = string.Format("{0}_{1}_{2}", Helpers.DummyIdentifier,
+                            safeIdentifier, i),
+                        QualifiedType = new QualifiedType(arrayType.Type),
+                        Offset = (uint) (field.Offset + i * arrayType.ElementSize),
+                        Namespace = owner
+                    };
+
+                    GenerateClassInternalsField(owner, dummy);
+                }
+            }
         }
 
-        private void GenerateClassField(Field field)
+        private void GenerateClassField(Field field, bool @public = false)
         {
             PushBlock(CSharpBlockKind.Field);
 
             GenerateDeclarationCommon(field);
 
-            var @class = (Class) field.Namespace;
-            if (@class.IsUnion)
-                WriteLine("[FieldOffset({0})]", field.Offset);
-
-            WriteLine("public {0} {1};", field.Type, SafeIdentifier(field.Name));
+            WriteLine("{0} {1} {2};", @public ? "public" : "private",
+                field.Type, field.Name);
 
             PopBlock(NewLineKind.BeforeNextBlock);
         }
@@ -829,7 +855,8 @@ namespace CppSharp.Generators.CSharp
             return Tuple.Create(library, decl.Mangled);
         }
 
-        private void GeneratePropertySetter<T>(QualifiedType returnType, T decl, Class @class)
+        private void GeneratePropertySetter<T>(T decl,
+            Class @class, bool isAbstract = false, Property property = null)
             where T : Declaration, ITypedDecl
         {
             if (!(decl is Function || decl is Field) )
@@ -838,7 +865,7 @@ namespace CppSharp.Generators.CSharp
             }
 
             PushBlock(CSharpBlockKind.Method);
-            WriteLine("set");
+            Write("set");
 
             var param = new Parameter
             {
@@ -855,13 +882,14 @@ namespace CppSharp.Generators.CSharp
             if (decl is Function)
             {
                 var function = decl as Function;
-                if (function.IsPure && Driver.Options.GenerateAbstractImpls)
+                if (isAbstract)
                 {
-                    Write("; ");
+                    Write(";");
                     PopBlock(NewLineKind.BeforeNextBlock);
                     return;
                 }
 
+                NewLine();
                 WriteStartBraceIndent();
                 if (function.Parameters.Count == 0)
                     throw new NotSupportedException("Expected at least one parameter in setter");
@@ -869,77 +897,147 @@ namespace CppSharp.Generators.CSharp
                 param.QualifiedType = function.Parameters[0].QualifiedType;
 
                 var method = function as Method;
-                if (method != null && method.OperatorKind == CXXOperatorKind.Subscript)
+                if (function.SynthKind == FunctionSynthKind.AbstractImplCall)
+                    GenerateVirtualPropertyCall(function, @class.BaseClass, property,
+                        new List<Parameter> { param });
+                else if (method != null && method.IsVirtual)
+                    GenerateVirtualPropertyCall(method, @class, property, new List<Parameter> { param });
+                else
                 {
-                    if (method.IsOverride && method.IsSynthetized)
-                    {
-                        GenerateVirtualTableFunctionCall(function, @class);
-                    }
-                    else
+                    if (method != null && method.OperatorKind == CXXOperatorKind.Subscript)
                     {
                         if (method.OperatorKind == CXXOperatorKind.Subscript)
                         {
-                            GenerateIndexerSetter(returnType, method);
+                            GenerateIndexerSetter(method);
                         }
                         else
                         {
-                            var parameters = new List<Parameter> { param };
-                            GenerateInternalFunctionCall(function, parameters);
+                            GenerateInternalFunctionCall(function, new List<Parameter> { param });
                         }
                     }
-                }
-                else
-                {
-                    var parameters = new List<Parameter> { param };
-                    GenerateInternalFunctionCall(function, parameters); 
+                    else
+                    {
+                        GenerateInternalFunctionCall(function, new List<Parameter> { param });
+                    }
                 }
                 WriteCloseBraceIndent();
             }
-            else if (decl is Field)
+            else
             {
-                WriteStartBraceIndent();
                 var field = decl as Field;
+                if (WrapSetterArrayOfPointers(decl.Name, field.Type))
+                    return;
 
-                WriteLine("var {0} = (Internal*){1}.ToPointer();",
-                    Generator.GeneratedIdentifier("ptr"), Helpers.InstanceIdentifier);
+                NewLine();
+                WriteStartBraceIndent();
 
+                ctx.Kind = CSharpMarshalKind.NativeField;
                 var marshal = new CSharpMarshalManagedToNativePrinter(ctx);
-                ctx.ReturnVarName = field.OriginalName;
+
+                var arrayType = field.Type as ArrayType;
+
+                if (arrayType != null && @class.IsValueType)
+                {
+                    ctx.ReturnVarName = HandleValueArray(arrayType, field);
+                }
+                else
+                {
+                    ctx.ReturnVarName = string.Format("{0}{1}{2}",
+                    @class.IsValueType
+                        ? Helpers.InstanceField
+                        : string.Format("((Internal*) {0})", Helpers.InstanceIdentifier),
+                    @class.IsValueType ? "." : "->",
+                    Helpers.SafeIdentifier(field.InternalName));
+                }
                 param.Visit(marshal);
 
                 if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
                     Write(marshal.Context.SupportBefore);
 
-                Write("{0}->{1} = {2}", Generator.GeneratedIdentifier("ptr"),
-                    Helpers.SafeIdentifier(field.OriginalName), marshal.Context.Return);
+                if (marshal.Context.Return.StringBuilder.Length > 0)
+                {
+                    WriteLine("{0} = {1};", ctx.ReturnVarName, marshal.Context.Return);
+                }
 
-                WriteLine(";");
+                if (arrayType != null && @class.IsValueType)
+                    WriteCloseBraceIndent();
+
                 WriteCloseBraceIndent();
             }
 
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        private void GenerateIndexerSetter(QualifiedType returnType, Function function)
+        private string HandleValueArray(ArrayType arrayType, Field field)
+        {
+            var originalType = new PointerType(new QualifiedType(arrayType.Type));
+            var arrPtrIden = Generator.GeneratedIdentifier("arrPtr");
+            var arrPtr = arrPtrIden;
+            var finalElementType = (arrayType.Type.GetFinalPointee() ?? arrayType.Type);
+            var isChar = finalElementType.IsPrimitiveType(PrimitiveType.Char);
+
+            string type;
+            if (Driver.Options.MarshalCharAsManagedChar && isChar)
+            {
+                var typePrinter = new CSharpTypePrinter(Driver);
+                typePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+                type = originalType.Visit(typePrinter).Type;
+                arrPtrIden = Generator.GeneratedIdentifier(arrPtrIden);
+            }
+            else
+            {
+                type = originalType.ToString();
+            }
+
+            WriteLine(string.Format("fixed ({0} {1} = {2}.{3})",
+                type, arrPtrIden, Helpers.InstanceField,
+                Helpers.SafeIdentifier(field.InternalName)));
+            WriteStartBraceIndent();
+            if (Driver.Options.MarshalCharAsManagedChar && isChar)
+                WriteLine("var {0} = ({1}) {2};", arrPtr, originalType, arrPtrIden);
+            return arrPtr;
+        }
+
+        private bool WrapSetterArrayOfPointers(string name, Type fieldType)
+        {
+            var arrayType = fieldType as ArrayType;
+            if (arrayType == null || !arrayType.Type.IsPointerToPrimitiveType())
+                return false;
+
+            NewLine();
+            WriteStartBraceIndent();
+            WriteLine("{0} = value;", name);
+            WriteLine("if (!{0}{1})", name, "Initialised");
+            WriteStartBraceIndent();
+            WriteLine("{0}{1} = true;", name, "Initialised");
+            WriteCloseBraceIndent();
+            WriteCloseBraceIndent();
+            PopBlock(NewLineKind.BeforeNextBlock);
+
+            return true;
+        }
+
+        private void GenerateIndexerSetter(Function function)
         {
             Type type;
-            returnType.Type.IsPointerTo(out type);
+            function.Type.IsPointerTo(out type);
             PrimitiveType primitiveType;
             string internalFunction = GetFunctionNativeIdentifier(function);
             if (type.IsPrimitiveType(out primitiveType))
             {
                 WriteLine("*Internal.{0}({1}, {2}) = value;", internalFunction,
-                    Helpers.InstanceIdentifier, function.Parameters[0].Name);
+                    GetInstanceParam(function), function.Parameters[0].Name);
             }
             else
             {
-                WriteLine("*({0}.Internal*) Internal.{1}({2}, {3}) = *({0}.Internal*) value.{2};",
-                    type.ToString(), internalFunction,
-                    Helpers.InstanceIdentifier, function.Parameters[0].Name);
+                WriteLine("*({0}.Internal*) Internal.{1}({2}, {3}) = *({0}.Internal*) value.{4};",
+                    type.ToString(), internalFunction, GetInstanceParam(function),
+                    function.Parameters[0].Name, Helpers.InstanceIdentifier);
             }
         }
 
-        private void GeneratePropertyGetter<T>(T decl, Class @class)
+        private void GeneratePropertyGetter<T>(QualifiedType returnType, T decl,
+            Class @class, bool isAbstract = false, Property property = null)
             where T : Declaration, ITypedDecl
         {
             PushBlock(CSharpBlockKind.Method);
@@ -948,48 +1046,50 @@ namespace CppSharp.Generators.CSharp
             if (decl is Function)
             {
                 var function = decl as Function;
-                if (function.IsPure && Driver.Options.GenerateAbstractImpls)
+                if (isAbstract)
                 {
-                    Write("; ");
+                    Write(";");
                     PopBlock(NewLineKind.BeforeNextBlock);
                     return;
                 }
 
                 NewLine();
                 WriteStartBraceIndent();
+
                 var method = function as Method;
-                if (method != null && method.IsOverride && method.IsSynthetized)
-                {
-                    GenerateVirtualTableFunctionCall(function, @class);
-                }
+                if (function.SynthKind == FunctionSynthKind.AbstractImplCall)
+                    GenerateVirtualPropertyCall(method, @class.BaseClass, property);
+                else if (method != null && method.IsVirtual)
+                    GenerateVirtualPropertyCall(method, @class, property);
                 else
-                {
-                    bool isPrimitiveIndexer = function.OperatorKind == CXXOperatorKind.Subscript &&
-                                              function.ReturnType.Type.IsPointerToPrimitiveType();
-                    if (isPrimitiveIndexer)
-                        TypePrinter.PushContext(CSharpTypePrinterContextKind.PrimitiveIndexer);
-                    GenerateInternalFunctionCall(function);
-                    if (isPrimitiveIndexer)
-                        TypePrinter.PopContext();
-                }
+                    GenerateInternalFunctionCall(function, function.Parameters, returnType.Type);
             }
             else if (decl is Field)
             {
+                var field = decl as Field;
+                if (WrapGetterArrayOfPointers(decl.Name, field.Type))
+                    return;
+
                 NewLine();
                 WriteStartBraceIndent();
-                var field = decl as Field;
-
-                WriteLine("var {0} = (Internal*){1}.ToPointer();",
-                    Generator.GeneratedIdentifier("ptr"), Helpers.InstanceIdentifier);
 
                 var ctx = new CSharpMarshalContext(Driver)
                 {
                     Kind = CSharpMarshalKind.NativeField,
                     ArgName = decl.Name,
-                    ReturnVarName = string.Format("{0}->{1}", Generator.GeneratedIdentifier("ptr"),
-                        Helpers.SafeIdentifier(field.OriginalName)),
+                    ReturnVarName = string.Format("{0}{1}{2}",
+                        @class.IsValueType
+                            ? Helpers.InstanceField
+                            : string.Format("((Internal*) {0})", Helpers.InstanceIdentifier),
+                        @class.IsValueType ? "." : "->",
+                        Helpers.SafeIdentifier(field.InternalName)),
                     ReturnType = decl.QualifiedType
                 };
+
+                var arrayType = field.Type as ArrayType;
+
+                if (arrayType != null && @class.IsValueType)
+                    ctx.ReturnVarName = HandleValueArray(arrayType, field);
 
                 var marshal = new CSharpMarshalNativeToManagedPrinter(ctx);
                 decl.CSharpMarshalToManaged(marshal);
@@ -998,6 +1098,9 @@ namespace CppSharp.Generators.CSharp
                     Write(marshal.Context.SupportBefore);
 
                 WriteLine("return {0};", marshal.Context.Return);
+
+                if (arrayType != null && @class.IsValueType)
+                    WriteCloseBraceIndent();
             }
             else if (decl is Variable)
             {
@@ -1011,15 +1114,19 @@ namespace CppSharp.Generators.CSharp
                 var location = string.Format("CppSharp.SymbolResolver.ResolveSymbol(\"{0}\", \"{1}\")",
                     libSymbol.Item1, libSymbol.Item2);
 
-                WriteLine("var {0} = ({1}*){2};", Generator.GeneratedIdentifier("ptr"),
-                    @var.Type, location);
+                var isRefTypeArray = decl.Type is ArrayType && @class != null && @class.IsRefType;
+                if (isRefTypeArray)
+                    WriteLine("var {0} = (byte*){1};", Generator.GeneratedIdentifier("ptr"), location);
+                else
+                    WriteLine("var {0} = ({1}*){2};", Generator.GeneratedIdentifier("ptr"),
+                        @var.Type, location);
 
                 TypePrinter.PopContext();
 
                 var ctx = new CSharpMarshalContext(Driver)
                 {
                     ArgName = decl.Name,
-                    ReturnVarName = "*" + Generator.GeneratedIdentifier("ptr"),
+                    ReturnVarName = (isRefTypeArray ? string.Empty : "*") + Generator.GeneratedIdentifier("ptr"),
                     ReturnType = new QualifiedType(var.Type)
                 };
 
@@ -1036,12 +1143,41 @@ namespace CppSharp.Generators.CSharp
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        public void GenerateClassMethods(Class @class)
+        private bool WrapGetterArrayOfPointers(string name, Type fieldType)
         {
-            var staticMethods = new List<Method>();
-            foreach (var method in @class.Methods)
+            var arrayType = fieldType as ArrayType;
+            if (arrayType != null && arrayType.Type.IsPointerToPrimitiveType())
             {
-                if (ASTUtils.CheckIgnoreMethod(method))
+                NewLine();
+                WriteStartBraceIndent();
+                WriteLine("if (!{0}{1})", name, "Initialised");
+                WriteStartBraceIndent();
+                WriteLine("{0} = null;", name);
+                WriteLine("{0}{1} = true;", name, "Initialised");
+                WriteCloseBraceIndent();
+                WriteLine("return {0};", name);
+                WriteCloseBraceIndent();
+                PopBlock(NewLineKind.BeforeNextBlock);
+                return true;
+            }
+            return false;
+        }
+
+        public void GenerateClassMethods(IList<Method> methods)
+        {
+            if (methods.Count == 0)
+                return;
+
+            var @class = (Class) methods[0].Namespace;
+
+            if (@class.IsValueType)
+                foreach (var @base in @class.Bases.Where(b => b.IsClass && !b.Class.Ignore))
+                    GenerateClassMethods(@base.Class.Methods.Where(m => !m.IsOperator).ToList());
+
+            var staticMethods = new List<Method>();
+            foreach (var method in methods)
+            {
+                if (ASTUtils.CheckIgnoreMethod(method, Options))
                     continue;
 
                 if (method.IsConstructor)
@@ -1064,9 +1200,13 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateClassVariables(Class @class)
         {
+            if (@class.IsValueType)
+                foreach (var @base in @class.Bases.Where(b => b.IsClass && !b.Class.Ignore))
+                    GenerateClassVariables(@base.Class);
+
             foreach (var variable in @class.Variables)
             {
-                if (variable.Ignore) continue;
+                if (!variable.IsGenerated) continue;
 
                 if (variable.Access != AccessSpecifier.Public)
                     continue;
@@ -1079,36 +1219,60 @@ namespace CppSharp.Generators.CSharp
 
         private void GenerateClassProperties(Class @class)
         {
-            foreach (var prop in @class.Properties.Where(p => !p.Ignore))
+            if (@class.IsValueType)
+                foreach (var @base in @class.Bases.Where(b => b.IsClass && !b.Class.Ignore && b.Class.IsDeclared))
+                    GenerateClassProperties(@base.Class);
+
+            GenerateProperties(@class);
+        }
+
+        private void GenerateProperties(Class @class)
+        {
+            foreach (var prop in @class.Properties.Where(p => p.IsGenerated))
             {
+                if (prop.IsInRefTypeAndBackedByValueClassField())
+                {
+                    GenerateClassField(prop.Field, true);
+                    continue;
+                }
+
                 PushBlock(CSharpBlockKind.Property);
 
-                // If this is an indexer that returns an address use the real type
-                // because there is a setter anyway.
-                var type = prop.Type;
-                if (prop.Parameters.Count > 0 && prop.Type.IsPointerToPrimitiveType())
-                    type = ((PointerType) prop.Type).Pointee;
+                ArrayType arrayType = prop.Type as ArrayType;
+                if (arrayType != null && arrayType.Type.IsPointerToPrimitiveType() && prop.Field != null)
+                {
+                    GenerateClassField(prop.Field);
+                    WriteLine("private bool {0};",
+                        GeneratedIdentifier(string.Format("{0}Initialised", prop.Field.InternalName)));
+                }
 
                 GenerateDeclarationCommon(prop);
                 if (prop.ExplicitInterfaceImpl == null)
                 {
-                    Write(Helpers.GetAccess(prop.Access));
+                    Write(Helpers.GetAccess(GetValidPropertyAccess(prop)));
 
                     if (prop.IsStatic)
                         Write("static ");
 
-                    if (prop.IsOverride)
+                    // check if overriding a property from a secondary base
+                    Property rootBaseProperty;
+                    var isOverride = prop.IsOverride &&
+                        (rootBaseProperty = @class.GetBaseProperty(prop, true, true)) != null &&
+                        (rootBaseProperty.IsVirtual || rootBaseProperty.IsPure);
+
+                    if (isOverride)
                         Write("override ");
-                    else if (prop.IsPure && Driver.Options.GenerateAbstractImpls)
+                    else if (prop.IsPure)
                         Write("abstract ");
-                    else if (prop.IsVirtual)
+
+                    if (prop.IsVirtual && !isOverride && !prop.IsPure)
                         Write("virtual ");
 
-                    WriteLine("{0} {1}", type, GetPropertyName(prop));
+                    WriteLine("{0} {1}", prop.Type, GetPropertyName(prop));
                 }
                 else
                 {
-                    WriteLine("{0} {1}.{2}", type, prop.ExplicitInterfaceImpl.Name,
+                    WriteLine("{0} {1}.{2}", prop.Type, prop.ExplicitInterfaceImpl.Name,
                         GetPropertyName(prop));
                 }
                 WriteStartBraceIndent();
@@ -1116,21 +1280,18 @@ namespace CppSharp.Generators.CSharp
                 if (prop.Field != null)
                 {
                     if (prop.HasGetter)
-                        GeneratePropertyGetter(prop.Field, @class);
+                        GeneratePropertyGetter(prop.QualifiedType, prop.Field, @class);
 
                     if (prop.HasSetter)
-                        GeneratePropertySetter(prop.Field.QualifiedType, prop.Field,
-                            @class);
+                        GeneratePropertySetter(prop.Field, @class);
                 }
                 else
                 {
                     if (prop.HasGetter)
-                        GeneratePropertyGetter(prop.GetMethod, @class);
+                        GeneratePropertyGetter(prop.QualifiedType, prop.GetMethod, @class, prop.IsPure, prop);
 
                     if (prop.HasSetter)
-                        GeneratePropertySetter(prop.GetMethod != null ?
-                            prop.GetMethod.ReturnType : prop.SetMethod.Parameters[0].QualifiedType,
-                            prop.SetMethod, @class);
+                        GeneratePropertySetter(prop.SetMethod, @class, prop.IsPure, prop);
                 }
 
                 WriteCloseBraceIndent();
@@ -1140,20 +1301,22 @@ namespace CppSharp.Generators.CSharp
 
         private string GetPropertyName(Property prop)
         {
-            return prop.Parameters.Count == 0 ? SafeIdentifier(prop.Name)
+            return prop.Parameters.Count == 0 ? prop.Name
                 : string.Format("this[{0}]", FormatMethodParameters(prop.Parameters));
         }
 
         private void GenerateVariable(Class @class, Type type, Variable variable)
         {
             PushBlock(CSharpBlockKind.Variable);
-            WriteLine("public static {0} {1}", type, SafeIdentifier(variable.Name));
+            
+            GenerateDeclarationCommon(variable);
+            WriteLine("public static {0} {1}", type, variable.Name);
             WriteStartBraceIndent();
 
-            GeneratePropertyGetter(variable, @class);
+            GeneratePropertyGetter(variable.QualifiedType, variable, @class);
 
             if (!variable.QualifiedType.Qualifiers.IsConst)
-                GeneratePropertySetter(variable.QualifiedType, variable, @class);
+                GeneratePropertySetter(variable, @class);
 
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
@@ -1161,17 +1324,11 @@ namespace CppSharp.Generators.CSharp
 
         #region Virtual Tables
 
-        public List<VTableComponent> GetVTableMethodEntries(Class @class)
-        {
-            var entries = VTables.GatherVTableMethodEntries(@class);
-            return entries.Where(e => !e.Method.Ignore ||
-                @class.GetPropertyByConstituentMethod(e.Method) != null).ToList();
-        }
-
         public List<VTableComponent> GetUniqueVTableMethodEntries(Class @class)
         {
             var uniqueEntries = new OrderedSet<VTableComponent>();
-            foreach (var entry in GetVTableMethodEntries(@class))
+            var vTableMethodEntries = VTables.GatherVTableMethodEntries(@class);
+            foreach (var entry in vTableMethodEntries.Where(e => !e.IsIgnored() && !e.Method.IsOperator))
                 uniqueEntries.Add(entry);
 
             return uniqueEntries.ToList();
@@ -1179,8 +1336,8 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateVTable(Class @class)
         {
-            var entries = GetVTableMethodEntries(@class);
-            if (entries.Count == 0)
+            var wrappedEntries = GetUniqueVTableMethodEntries(@class);
+            if (wrappedEntries.Count == 0)
                 return;
 
             PushBlock(CSharpBlockKind.Region);
@@ -1188,146 +1345,153 @@ namespace CppSharp.Generators.CSharp
             NewLine();
 
             // Generate a delegate type for each method.
-            foreach (var entry in GetUniqueVTableMethodEntries(@class))
+            foreach (var method in wrappedEntries.Select(e => e.Method))
             {
-                var method = entry.Method;
                 GenerateVTableMethodDelegates(@class, method);
             }
 
-            const string Dictionary = "System.Collections.Generic.Dictionary";
-
-            WriteLine("static IntPtr[] _OldVTables;");
-            WriteLine("static IntPtr[] _NewVTables;");
-            WriteLine("static IntPtr[] _Thunks;");
-            WriteLine("static {0}<IntPtr, WeakReference> _References;", Dictionary);
+            WriteLine("private static void*[] __ManagedVTables;");
+            WriteLine("private static void*[] _Thunks;");
             NewLine();
 
-            GenerateVTableClassSetup(@class, Dictionary, entries);
+            GenerateVTableClassSetup(@class, wrappedEntries);
 
             WriteLine("#endregion");
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        private void GenerateVTableClassSetup(Class @class, string Dictionary,
-            List<VTableComponent> entries)
+        private void GenerateVTableClassSetup(Class @class, IList<VTableComponent> wrappedEntries)
         {
-            WriteLine("void SetupVTables(global::System.IntPtr instance)");
+            WriteLine("void SetupVTables()");
             WriteStartBraceIndent();
 
-            WriteLine("var native = (Internal*)instance.ToPointer();");
-            NewLine();
-
-            WriteLine("if (_References == null)");
-            WriteLineIndent("_References = new {0}<IntPtr, WeakReference>();", Dictionary);
-            NewLine();
-
-            WriteLine("if (_References.ContainsKey(instance))");
+            WriteLine("if (__OriginalVTables != null)");
             WriteLineIndent("return;");
 
+            WriteLine("var native = (Internal*) {0}.ToPointer();", Helpers.InstanceIdentifier);
             NewLine();
-            WriteLine("_References[instance] = new WeakReference(this);");
-            NewLine();
 
-            // Save the original vftable pointers.
-            WriteLine("if (_OldVTables == null)");
-            WriteStartBraceIndent();
+            SaveOriginalVTablePointers(@class.Layout.VFTables);
 
-            var vftables = @class.Layout.VFTables;
-            WriteLine("_OldVTables = new IntPtr[{0}];", vftables.Count);
-
-            var index = 0;
-            foreach (var vfptr in vftables)
-            {
-                WriteLine("_OldVTables[{0}] = native->vfptr{0};", index++);
-            }
-
-            WriteCloseBraceIndent();
             NewLine();
 
             // Get the _Thunks
             WriteLine("if (_Thunks == null)");
             WriteStartBraceIndent();
-
-            WriteLine("_Thunks = new IntPtr[{0}];", entries.Count);
+            WriteLine("_Thunks = new void*[{0}];", wrappedEntries.Count);
 
             var uniqueEntries = new HashSet<VTableComponent>();
 
-            index = 0;
-            foreach (var entry in entries)
+            for (int i = 0; i < wrappedEntries.Count; i++)
             {
+                var entry = wrappedEntries[i];
                 var method = entry.Method;
-                var delegateName = GetVTableMethodDelegateName(method);
-                var delegateInstance = delegateName + "Instance";
+                var name = GetVTableMethodDelegateName(method);
+                var instance = name + "Instance";
                 if (uniqueEntries.Add(entry))
-                    WriteLine("{0} += {1}Hook;", delegateInstance, delegateName);
-                WriteLine("_Thunks[{0}] = Marshal.GetFunctionPointerForDelegate({1});",
-                    index++, delegateInstance);
+                    WriteLine("{0} += {1}Hook;", instance, name);
+                WriteLine("_Thunks[{0}] = Marshal.GetFunctionPointerForDelegate({1}).ToPointer();",
+                    i, instance);
             }
-
             WriteCloseBraceIndent();
+
             NewLine();
 
-            // Allocate new vtables if there are none yet.
-            WriteLine("if (_NewVTables == null)");
+            WriteLine("if (__ManagedVTables == null)");
             WriteStartBraceIndent();
 
-            WriteLine("_NewVTables = new IntPtr[{0}];", vftables.Count);
-
-            index = 0;
-            foreach (var vfptr in vftables)
-            {
-                var size = vfptr.Layout.Components.Count;
-                WriteLine("var vfptr{0} = Marshal.AllocHGlobal({1} * IntPtr.Size);",
-                    index, size);
-                WriteLine("_NewVTables[{0}] = vfptr{0};", index);
-
-                var entryIndex = 0;
-                foreach (var entry in vfptr.Layout.Components)
-                {
-                    var offsetInBytes = VTables.GetVTableComponentIndex(@class, entry)
-                        * IntPtr.Size;
-                    WriteLine("*(IntPtr*)(vfptr{0} + {1}) = _Thunks[{2}];", index,
-                        offsetInBytes, entryIndex++);
-                }
-
-                index++;
-            }
-
-            WriteCloseBraceIndent();
-            NewLine();
-
-            // Set the previous delegate instances pointers in the object
-            // virtual table.
-            index = 0;
-            foreach (var vfptr in @class.Layout.VFTables)
-                WriteLine("native->vfptr{0} = _NewVTables[{0}];", index++);
+            if (Options.IsMicrosoftAbi)
+                AllocateNewVTablesMS(@class, wrappedEntries);
+            else
+                AllocateNewVTablesItanium(@class, wrappedEntries);
 
             WriteCloseBraceIndent();
             NewLine();
         }
 
-        private void GenerateVTableClassSetupCall(Class @class, bool addPointerGuard = false)
+        private void SaveOriginalVTablePointers(ICollection<VFTableInfo> vfTables)
         {
-            var entries = GetVTableMethodEntries(@class);
-            if (Options.GenerateVirtualTables && @class.IsDynamic && entries.Count != 0)
+            if (Driver.Options.IsMicrosoftAbi)
+                WriteLine("__OriginalVTables = new void*[] {{ {0} }};",
+                    string.Join(", ", vfTables.Select((v, i) => string.Format("native->vfptr{0}.ToPointer()", i))));
+            else
+                WriteLine("__OriginalVTables = new void*[] { native->vfptr0.ToPointer() };");
+        }
+
+        private void AllocateNewVTablesMS(Class @class, IList<VTableComponent> wrappedEntries)
+        {
+            WriteLine("__ManagedVTables = new void*[{0}];", @class.Layout.VFTables.Count);
+
+            for (int tableIndex = 0; tableIndex < @class.Layout.VFTables.Count; tableIndex++)
             {
-                // called from internal ctors which may have been passed an IntPtr.Zero
-                if (addPointerGuard)
-                {
-                    WriteLine("if ({0} != global::System.IntPtr.Zero)", Helpers.InstanceIdentifier);
-                    PushIndent();
-                }
-                WriteLine("SetupVTables({0});", Generator.GeneratedIdentifier("Instance"));
-                if (addPointerGuard)
-                    PopIndent();
+                var vfptr = @class.Layout.VFTables[tableIndex];
+                var size = vfptr.Layout.Components.Count;
+                WriteLine("var vfptr{0} = Marshal.AllocHGlobal({1} * {2});",
+                    tableIndex, size, Driver.TargetInfo.PointerWidth / 8);
+                WriteLine("__ManagedVTables[{0}] = vfptr{0}.ToPointer();", tableIndex);
+
+                AllocateNewVTableEntries(vfptr.Layout.Components, wrappedEntries, tableIndex);
             }
+
+            WriteCloseBraceIndent();
+            NewLine();
+
+            for (var i = 0; i < @class.Layout.VFTables.Count; i++)
+                WriteLine("native->vfptr{0} = new IntPtr(__ManagedVTables[{0}]);", i);
+        }
+
+        private void AllocateNewVTablesItanium(Class @class, IList<VTableComponent> wrappedEntries)
+        {
+            WriteLine("__ManagedVTables = new void*[1];");
+
+            var size = @class.Layout.Layout.Components.Count;
+            var pointerSize = Driver.TargetInfo.PointerWidth / 8;
+            WriteLine("var vtptr = Marshal.AllocHGlobal({0} * {1});", size, pointerSize);
+
+            WriteLine("var vfptr0 = vtptr + {0} * {1};", VTables.ItaniumOffsetToTopAndRTTI, pointerSize);
+            WriteLine("__ManagedVTables[0] = vfptr0.ToPointer();");
+
+            AllocateNewVTableEntries(@class.Layout.Layout.Components,
+                wrappedEntries, tableIndex: 0);
+
+            WriteCloseBraceIndent();
+            NewLine();
+
+            WriteLine("native->vfptr0 = new IntPtr(__ManagedVTables[0]);");
+        }
+
+        private void AllocateNewVTableEntries(IList<VTableComponent> entries,
+            IList<VTableComponent> wrappedEntries, int tableIndex)
+        {
+            var pointerSize = Driver.TargetInfo.PointerWidth / 8;
+            for (int i = 0; i < entries.Count; i++)
+            {
+                var entry = entries[i];
+                var offsetInBytes = pointerSize
+                    * (i - (Options.IsMicrosoftAbi ? 0 : VTables.ItaniumOffsetToTopAndRTTI));
+
+                if ((entry.Kind == VTableComponentKind.FunctionPointer ||
+                     entry.Kind == VTableComponentKind.DeletingDtorPointer) &&
+                    !entry.IsIgnored())
+                    WriteLine("*(void**)(vfptr{0} + {1}) = _Thunks[{2}];", tableIndex,
+                        offsetInBytes, wrappedEntries.IndexOf(entry));
+                else
+                    WriteLine("*(void**)(vfptr{0} + {1}) = *(void**)(native->vfptr{0} + {1});",
+                        tableIndex, offsetInBytes);
+            }
+        }
+
+        private void GenerateVTableClassSetupCall(Class @class)
+        {
+            if (@class.IsDynamic && GetUniqueVTableMethodEntries(@class).Count > 0)
+                WriteLine("SetupVTables();");
         }
 
         private void GenerateVTableManagedCall(Method method)
         {
             if (method.IsDestructor)
             {
-                WriteLine("target.Dispose();");
+                WriteLine("{0}.Dispose(false);", Helpers.TargetIdentifier);
                 return;
             }
 
@@ -1335,7 +1499,7 @@ namespace CppSharp.Generators.CSharp
             for (int i = 0; i < method.Parameters.Count; i++)
             {
                 var param = method.Parameters[i];
-                if (param.Ignore)
+                if (!param.IsGenerated && param.GenerationKind != GenerationKind.Link)
                     continue;
 
                 if (param.Kind == ParameterKind.IndirectReturnType)
@@ -1344,10 +1508,11 @@ namespace CppSharp.Generators.CSharp
                 var ctx = new CSharpMarshalContext(Driver)
                 {
                     ReturnType = param.QualifiedType,
-                    ReturnVarName = SafeIdentifier(param.Name)
+                    ReturnVarName = param.Name,
+                    ParameterIndex = i
                 };
 
-                var marshal = new CSharpMarshalNativeToManagedPrinter(ctx) { VarSuffix = i };
+                var marshal = new CSharpMarshalNativeToManagedPrinter(ctx) { MarshalsParameter = true };
                 param.Visit(marshal);
 
                 if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
@@ -1359,31 +1524,30 @@ namespace CppSharp.Generators.CSharp
             var hasReturn = !method.OriginalReturnType.Type.IsPrimitiveType(PrimitiveType.Void);
 
             if (hasReturn)
-                Write("var _ret = ");
+                Write("var {0} = ", Helpers.ReturnIdentifier);
 
-            // HACK: because of the non-shared v-table entries bug we must look for the real method by name
-            Method m = ((Class) method.Namespace).GetMethodByName(method.Name);
-            if (m.IsGenerated)
+            if (method.IsGenerated || method.GenerationKind == GenerationKind.Link)
             {
-                WriteLine("target.{0}({1});", SafeIdentifier(method.Name), string.Join(", ", marshals));              
+                WriteLine("{0}.{1}({2});", Helpers.TargetIdentifier,
+                    method.Name, string.Join(", ", marshals));              
             }
             else
             {
-                InvokeProperty(m, marshals);
+                InvokeProperty(method, marshals);
             }
 
             if (hasReturn)
             {
                 var param = new Parameter
                 {
-                    Name = "_ret",
-                    QualifiedType = method.ReturnType
+                    Name = Helpers.ReturnIdentifier,
+                    QualifiedType = method.OriginalReturnType
                 };
 
                 // Marshal the managed result to native
                 var ctx = new CSharpMarshalContext(Driver)
                 {
-                    ArgName = "_ret",
+                    ArgName = Helpers.ReturnIdentifier,
                     Parameter = param,
                     Function = method
                 };
@@ -1394,7 +1558,18 @@ namespace CppSharp.Generators.CSharp
                 if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
                     Write(marshal.Context.SupportBefore);
 
-                WriteLine("return {0};", marshal.Context.Return);
+                if (method.HasIndirectReturnTypeParameter)
+                {
+                    var retParam = method.Parameters.First(p => p.Kind == ParameterKind.IndirectReturnType);
+                    TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+                    WriteLine("*({0}*) {1} = {2};",
+                        method.OriginalReturnType.Visit(TypePrinter), retParam.Name, marshal.Context.Return);
+                    TypePrinter.PopContext();
+                }
+                else
+                {
+                    WriteLine("return {0};", marshal.Context.Return);                    
+                }
             }
         }
 
@@ -1406,12 +1581,12 @@ namespace CppSharp.Generators.CSharp
             {
                 property = ((Class) method.Namespace).Properties.First(
                     p => p.SetMethod == method);
-                WriteLine("target.{0} = {1};", SafeIdentifier(property.Name),
+                WriteLine("{0}.{1} = {2};", Helpers.TargetIdentifier, property.Name,
                     string.Join(", ", marshals));
             }
             else
             {
-                WriteLine("target.{0};", SafeIdentifier(property.Name));
+                WriteLine("{0}.{1};", Helpers.TargetIdentifier, property.Name);
             }
         }
 
@@ -1419,33 +1594,39 @@ namespace CppSharp.Generators.CSharp
         {
             PushBlock(CSharpBlockKind.VTableDelegate);
 
-            var cleanSig = method.Signature.ReplaceLineBreaks("");
-            cleanSig = Regex.Replace(cleanSig, @"\s+", " ");
+            // This works around a parser bug, see https://github.com/mono/CppSharp/issues/202
+            if (method.Signature != null)
+            {
+                var cleanSig = method.Signature.ReplaceLineBreaks("");
+                cleanSig = Regex.Replace(cleanSig, @"\s+", " ");
 
-            WriteLine("// {0}", cleanSig);
+                WriteLine("// {0}", cleanSig);
+            }
             WriteLine("[SuppressUnmanagedCodeSecurity]");
             WriteLine("[UnmanagedFunctionPointerAttribute(global::System.Runtime.InteropServices.CallingConvention.{0})]",
-                Helpers.ToCSharpCallConv(method.CallingConvention));
+                method.CallingConvention.ToInteropCallConv());
 
             CSharpTypePrinterResult retType;
             var @params = GatherInternalParams(method, out retType);
 
-            var delegateName = GetVTableMethodDelegateName(method);
-            WriteLine("delegate {0} {1}({2});", retType, delegateName,
+            var vTableMethodDelegateName = GetVTableMethodDelegateName(method);
+            WriteLine("internal delegate {0} {1}({2});", retType, vTableMethodDelegateName,
                 string.Join(", ", @params));
 
-            WriteLine("static {0} {0}Instance;", delegateName);
+            WriteLine("private static {0} {0}Instance;", vTableMethodDelegateName);
             NewLine();
 
-            WriteLine("static {0} {1}Hook({2})", retType, delegateName,
+            WriteLine("private static {0} {1}Hook({2})", retType, vTableMethodDelegateName,
                 string.Join(", ", @params));
             WriteStartBraceIndent();
 
-            WriteLine("if (!_References.ContainsKey(instance))");
-            WriteLineIndent("throw new Exception(\"No managed instance was found\");");
+            WriteLine("if (!NativeToManagedMap.ContainsKey(instance))");
+            WriteLineIndent("throw new global::System.Exception(\"No managed instance was found\");");
             NewLine();
 
-            WriteLine("var target = ({0}) _References[instance].Target;", @class.Name);
+            WriteLine("var {0} = ({1}) NativeToManagedMap[instance];", Helpers.TargetIdentifier, @class.Name);
+            WriteLine("if ({0}.{1})", Helpers.TargetIdentifier, Helpers.OwnsNativeInstanceIdentifier);
+            WriteLineIndent("{0}.SetupVTables();", Helpers.TargetIdentifier);
             GenerateVTableManagedCall(method);
 
             WriteCloseBraceIndent();
@@ -1453,9 +1634,9 @@ namespace CppSharp.Generators.CSharp
             PopBlock(NewLineKind.Always);
         }
 
-        public string GetVTableMethodDelegateName(Method method)
+        public string GetVTableMethodDelegateName(Function function)
         {
-            var nativeId = GetFunctionNativeIdentifier(method);
+            var nativeId = GetFunctionNativeIdentifier(function);
 
             // Trim '@' (if any) because '@' is valid only as the first symbol.
             nativeId = nativeId.Trim('@');
@@ -1465,13 +1646,25 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateVTablePointers(Class @class)
         {
-            var index = 0;
-            foreach (var info in @class.Layout.VFTables)
+            if (Options.IsMicrosoftAbi)
+            {
+                var index = 0;
+                foreach (var info in @class.Layout.VFTables)
+                {
+                    PushBlock(CSharpBlockKind.InternalsClassField);
+
+                    WriteLine("[FieldOffset({0})]", info.VFPtrFullOffset);
+                    WriteLine("public global::System.IntPtr vfptr{0};", index++);
+
+                    PopBlock(NewLineKind.BeforeNextBlock);
+                }
+            }
+            else
             {
                 PushBlock(CSharpBlockKind.InternalsClassField);
 
-                WriteLine("[FieldOffset({0})]", info.VFPtrFullOffset);
-                WriteLine("public global::System.IntPtr vfptr{0};", index++);
+                WriteLine("[FieldOffset(0)]");
+                WriteLine("public global::System.IntPtr vfptr0;");
 
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
@@ -1481,10 +1674,6 @@ namespace CppSharp.Generators.CSharp
 
         #region Events
 
-        private string delegateName;
-        private string delegateInstance;
-        private string delegateRaise;
-
         private void GenerateEvent(Event @event)
         {
             PushBlock(CSharpBlockKind.Event, @event);
@@ -1492,9 +1681,9 @@ namespace CppSharp.Generators.CSharp
             var args = TypePrinter.VisitParameters(@event.Parameters, hasNames: true);
             TypePrinter.PopContext();
 
-            delegateInstance = Generator.GeneratedIdentifier(@event.OriginalName);
-            delegateName = delegateInstance + "Delegate";
-            delegateRaise = delegateInstance + "RaiseInstance";
+            var delegateInstance = Generator.GeneratedIdentifier(@event.OriginalName);
+            var delegateName = delegateInstance + "Delegate";
+            var delegateRaise = delegateInstance + "RaiseInstance";
 
             WriteLine("[UnmanagedFunctionPointerAttribute(global::System.Runtime.InteropServices.CallingConvention.Cdecl)]");
             WriteLine("delegate void {0}({1});", delegateName, args);
@@ -1502,22 +1691,22 @@ namespace CppSharp.Generators.CSharp
             NewLine();
 
             WriteLine("{0} {1};", @event.Type, delegateInstance);
-            WriteLine("public event {0} {1}", @event.Type, Helpers.SafeIdentifier(@event.Name));
+            WriteLine("public event {0} {1}", @event.Type, @event.Name);
             WriteStartBraceIndent();
 
-            GenerateEventAdd(@event);
+            GenerateEventAdd(@event, delegateRaise, delegateName, delegateInstance);
             NewLine();
 
-            GenerateEventRemove(@event);
+            GenerateEventRemove(@event, delegateInstance);
 
             WriteCloseBraceIndent();
             NewLine();
 
-            GenerateEventRaiseWrapper(@event);
+            GenerateEventRaiseWrapper(@event, delegateInstance);
             PopBlock(NewLineKind.BeforeNextBlock);
         }
 
-        private void GenerateEventAdd(Event @event)
+        private void GenerateEventAdd(Event @event, string delegateRaise, string delegateName, string delegateInstance)
         {
             WriteLine("add");
             WriteStartBraceIndent();
@@ -1543,7 +1732,7 @@ namespace CppSharp.Generators.CSharp
             WriteCloseBraceIndent();
         }
 
-        private void GenerateEventRemove(Event @event)
+        private void GenerateEventRemove(ITypedDecl @event, string delegateInstance)
         {
             WriteLine("remove");
             WriteStartBraceIndent();
@@ -1554,7 +1743,7 @@ namespace CppSharp.Generators.CSharp
             WriteCloseBraceIndent();
         }
 
-        private void GenerateEventRaiseWrapper(Event @event)
+        private void GenerateEventRaiseWrapper(Event @event, string delegateInstance)
         {
             TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
             var args = TypePrinter.VisitParameters(@event.Parameters, hasNames: true);
@@ -1568,7 +1757,7 @@ namespace CppSharp.Generators.CSharp
             {
                 var ctx = new CSharpMarshalContext(Driver)
                 {
-                    ReturnVarName = Helpers.SafeIdentifier(param.Name),
+                    ReturnVarName = param.Name,
                     ReturnType = param.QualifiedType
                 };
 
@@ -1592,19 +1781,43 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateClassConstructors(Class @class)
         {
+            if (@class.IsStatic)
+                return;
+
             // Output a default constructor that takes the native pointer.
             GenerateNativeConstructor(@class);
 
             foreach (var ctor in @class.Constructors)
             {
-                if (ASTUtils.CheckIgnoreMethod(ctor))
+                if (ASTUtils.CheckIgnoreMethod(ctor, Options))
                     continue;
 
                 GenerateMethod(ctor, @class);
             }
 
             if (@class.IsRefType)
-                GenerateDisposeMethods(@class);
+            {
+                GenerateClassFinalizer(@class);
+
+                // Only root bases need a Dispose
+                if (ShouldGenerateClassNativeField(@class))
+                    GenerateDisposeMethods(@class);
+            }
+        }
+
+        private void GenerateClassFinalizer(INamedDecl @class)
+        {
+            if (!Options.GenerateFinalizers)
+                return;
+
+            PushBlock(CSharpBlockKind.Finalizer);
+
+            WriteLine("~{0}()", @class.Name);
+            WriteStartBraceIndent();
+            WriteLine("Dispose(false);");
+            WriteCloseBraceIndent();
+
+            PopBlock(NewLineKind.BeforeNextBlock);
         }
 
         private void GenerateDisposeMethods(Class @class)
@@ -1619,7 +1832,8 @@ namespace CppSharp.Generators.CSharp
                 WriteStartBraceIndent();
 
                 WriteLine("Dispose(disposing: true);");
-                WriteLine("GC.SuppressFinalize(this);");
+                if (Options.GenerateFinalizers)
+                    WriteLine("GC.SuppressFinalize(this);");
 
                 WriteCloseBraceIndent();
                 PopBlock(NewLineKind.BeforeNextBlock);
@@ -1629,29 +1843,62 @@ namespace CppSharp.Generators.CSharp
             PushBlock(CSharpBlockKind.Method);
             if (@class.IsValueType)
             {
-                this.Write("private ");
+                Write("private ");
             }
             else
             {
-                this.Write("protected ");
-                this.Write(hasBaseClass ? "override " : "virtual ");
+                Write("protected ");
+                Write(hasBaseClass ? "override " : "virtual ");
             }
 
             WriteLine("void Dispose(bool disposing)");
             WriteStartBraceIndent();
+            WriteLine("if (!{0} && disposing)", Helpers.OwnsNativeInstanceIdentifier);
+            WriteLineIndent("throw new global::System.InvalidOperationException" +
+                "(\"Managed instances owned by native code cannot be disposed of.\");");
 
-            if (ShouldGenerateClassNativeField(@class))
+            if (@class.IsRefType)
             {
-                var dtor = @class.Methods.FirstOrDefault(method => method.IsDestructor);
-                if (dtor != null && @class.HasNonTrivialDestructor)
-                    WriteLine("Internal.{0}({1});", GetFunctionNativeIdentifier(dtor),
-                        Helpers.InstanceIdentifier);
+                var @base = @class.GetNonIgnoredRootBase();
 
-                WriteLine("Marshal.FreeHGlobal({0});", Helpers.InstanceIdentifier);
+                // Use interfaces if any - derived types with a this class as a seconary base, must be compatible with the map
+                var @interface = @base.Namespace.Classes.Find(c => c.OriginalClass == @base);
+
+                // The local var must be of the exact type in the object map because of TryRemove
+                WriteLine("{0} {1};",
+                    QualifiedIdentifierIfNeeded(@interface ?? (@base.IsAbstractImpl ? @base.BaseClass : @base)),
+                    Helpers.DummyIdentifier);
+                WriteLine("NativeToManagedMap.TryRemove({0}, out {1});",
+                    Helpers.InstanceIdentifier, Helpers.DummyIdentifier);
+                if (@class.IsDynamic && GetUniqueVTableMethodEntries(@class).Count != 0)
+                {
+                    if (Options.IsMicrosoftAbi)
+                        for (var i = 0; i < @class.Layout.VFTables.Count; i++)
+                            WriteLine("((Internal*) {0})->vfptr{1} = new global::System.IntPtr(__OriginalVTables[{1}]);",
+                                Helpers.InstanceIdentifier, i);
+                    else
+                        WriteLine("((Internal*) {0})->vfptr0 = new global::System.IntPtr(__OriginalVTables[0]);",
+                            Helpers.InstanceIdentifier);
+                }
             }
 
-            if (hasBaseClass)
-                WriteLine("base.Dispose(disposing);");
+            var dtor = @class.Destructors.FirstOrDefault();
+            if (dtor != null && dtor.Access != AccessSpecifier.Private &&
+                @class.HasNonTrivialDestructor && !dtor.IsPure)
+            {
+                NativeLibrary library;
+                if (!Options.CheckSymbols ||
+                    Driver.Symbols.FindLibraryBySymbol(dtor.Mangled, out library))
+                {
+                    if (dtor.IsVirtual)
+                        GenerateVirtualFunctionCall(dtor, @class);
+                    else
+                        GenerateInternalFunctionCall(dtor);
+                }
+            }
+
+            WriteLine("if ({0})", Helpers.OwnsNativeInstanceIdentifier);
+            WriteLineIndent("Marshal.FreeHGlobal({0});", Helpers.InstanceIdentifier);
 
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
@@ -1659,88 +1906,157 @@ namespace CppSharp.Generators.CSharp
 
         private void GenerateNativeConstructor(Class @class)
         {
-            PushBlock(CSharpBlockKind.Method);
-            string className = @class.Name;
-            string safeIdentifier = SafeIdentifier(className);
-            if (@class.Access == AccessSpecifier.Private && className.EndsWith("Internal"))
+            var shouldGenerateClassNativeField = ShouldGenerateClassNativeField(@class);
+            if (@class.IsRefType && shouldGenerateClassNativeField)
             {
-                className = className.Substring(0,
-                    safeIdentifier.LastIndexOf("Internal", StringComparison.Ordinal));
+                PushBlock(CSharpBlockKind.Field);
+                WriteLine("protected bool {0};", Helpers.OwnsNativeInstanceIdentifier);
+                PopBlock(NewLineKind.BeforeNextBlock);
             }
-            WriteLine("internal {0}({1}.Internal* native)", safeIdentifier,
-                className);
-            WriteLineIndent(": this(new global::System.IntPtr(native))");
-            WriteStartBraceIndent();
-            WriteCloseBraceIndent();
-            PopBlock(NewLineKind.BeforeNextBlock);
+
+            var className = @class.IsAbstractImpl ? @class.BaseClass.Name : @class.Name;
+
+            var ctorCall = string.Format("{0}{1}", @class.Name, @class.IsAbstract ? "Internal" : "");
+            if (!@class.IsAbstractImpl)
+            {
+                PushBlock(CSharpBlockKind.Method);
+                WriteLine("public static {0}{1} {2}(global::System.IntPtr native{3}{4})",
+                    @class.NeedsBase && !@class.BaseClass.IsInterface ? "new " : string.Empty,
+                    @class.Name, Helpers.CreateInstanceIdentifier,
+                    @class.IsRefType ? ", bool ownsNativeInstance = false" : string.Empty,
+                    ", bool skipVTables = false");
+                WriteStartBraceIndent();
+                WriteLine("return new {0}(({1}.Internal*) native, skipVTables){2};", ctorCall, className,
+                    @class.IsRefType
+                        ? string.Format(" {{ {0} = ownsNativeInstance }}", Helpers.OwnsNativeInstanceIdentifier)
+                        : string.Empty);
+                WriteCloseBraceIndent();
+                PopBlock(NewLineKind.BeforeNextBlock);
+            }
+
+            GenerateNativeConstructorByValue(@class, className, ctorCall);
 
             PushBlock(CSharpBlockKind.Method);
-            WriteLine("internal {0}({1}.Internal native)", safeIdentifier, className);
-            WriteLineIndent(": this(&native)");
-            WriteStartBraceIndent();
-            WriteCloseBraceIndent();
-            PopBlock(NewLineKind.BeforeNextBlock);
-
-            PushBlock(CSharpBlockKind.Method);
-            WriteLine("internal {0}(global::System.IntPtr native){1}", safeIdentifier,
-                @class.IsValueType ? " : this()" : string.Empty);
+            WriteLine("{0} {1}({2}.Internal* native, bool skipVTables = false){3}",
+                @class.IsAbstractImpl ? "internal" : (@class.IsRefType ? "protected" : "private"),
+                @class.Name, className, @class.IsValueType ? " : this()" : string.Empty);
 
             var hasBaseClass = @class.HasBaseClass && @class.BaseClass.IsRefType;
             if (hasBaseClass)
-                WriteLineIndent(": base(native)");
+                WriteLineIndent(": base(({0}.Internal*) null)", QualifiedIdentifierIfNeeded(@class.BaseClass));
 
             WriteStartBraceIndent();
 
             if (@class.IsRefType)
             {
-                if (ShouldGenerateClassNativeField(@class))
+                if (@class.HasBaseClass)
+                    WriteLine("{0} = {1};", Helpers.PointerAdjustmentIdentifier, ClassExtensions.ComputeNonVirtualBaseClassOffsetTo(@class, @class.BaseClass));
+                if (!@class.IsAbstractImpl)
                 {
-                    WriteLine("{0} = native;", Helpers.InstanceIdentifier);
-                    GenerateVTableClassSetupCall(@class, true);
+                    WriteLine("if (native == null)");
+                    WriteLineIndent("return;");
+                }
+
+                WriteLine("{0} = new global::System.IntPtr(native);", Helpers.InstanceIdentifier);
+                var dtor = @class.Destructors.FirstOrDefault();
+                var hasVTables = @class.IsDynamic && GetUniqueVTableMethodEntries(@class).Count > 0;
+                var setupVTables = !@class.IsAbstractImpl && hasVTables && dtor != null && dtor.IsVirtual;
+                if (setupVTables)
+                {
+                    WriteLine("if (skipVTables)");
+                    PushIndent();
+                }
+
+                if (@class.IsAbstractImpl || hasVTables)
+                    SaveOriginalVTablePointers(@class.Layout.VFTables);
+
+                if (setupVTables)
+                {
+                    PopIndent();
+                    WriteLine("else");
+                    PushIndent();
+                    GenerateVTableClassSetupCall(@class);
+                    PopIndent();
                 }
             }
             else
             {
-                WriteLine("var {0} = (Internal*){1}.ToPointer();",
-                    Generator.GeneratedIdentifier("ptr"), "native");
-                GenerateStructMarshalingFields(@class);
+                WriteLine("{0} = *native;", Helpers.InstanceField);
             }
 
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
+        }
 
-            if (@class.IsValueType)
+        private void GenerateNativeConstructorByValue(Class @class, string className, string ctorCall)
+        {
+            if (!@class.IsAbstractImpl)
             {
                 PushBlock(CSharpBlockKind.Method);
-                WriteLine("internal Internal ToInternal()");
+                WriteLine("public static {0} {1}({0}.Internal native, bool skipVTables = false)",
+                    className, Helpers.CreateInstanceIdentifier);
                 WriteStartBraceIndent();
-                GenerateStructInternalMarshaling(@class);
+                WriteLine("return new {0}(native, skipVTables);", ctorCall);
+                WriteCloseBraceIndent();
+                PopBlock(NewLineKind.BeforeNextBlock);   
+            }
+
+            if (@class.IsRefType && !@class.IsAbstract)
+            {
+                PushBlock(CSharpBlockKind.Method);
+                WriteLine("private static {0}.Internal* __CopyValue({0}.Internal native)", className);
+                WriteStartBraceIndent();
+                var copyCtorMethod = @class.Methods.FirstOrDefault(method =>
+                    method.IsCopyConstructor);
+                if (@class.HasNonTrivialCopyConstructor && copyCtorMethod != null && copyCtorMethod.IsGenerated)
+                {
+                    // Allocate memory for a new native object and call the ctor.
+                    WriteLine("var ret = Marshal.AllocHGlobal({0});", @class.Layout.Size);
+                    WriteLine("{0}.Internal.{1}(ret, new global::System.IntPtr(&native));",
+                        QualifiedIdentifierIfNeeded(@class), GetFunctionNativeIdentifier(copyCtorMethod));
+                    WriteLine("return ({0}.Internal*) ret;", className);
+                }
+                else
+                {
+                    WriteLine("var ret = ({0}.Internal*) Marshal.AllocHGlobal({1});",
+                        className, @class.Layout.Size);
+                    WriteLine("*ret = native;", className);
+                    WriteLine("return ret;");
+                }
                 WriteCloseBraceIndent();
                 PopBlock(NewLineKind.BeforeNextBlock);
-
+            }
+            if (!@class.IsAbstract)
+            {
                 PushBlock(CSharpBlockKind.Method);
-                WriteLine("internal void FromInternal(Internal* native)");
+                WriteLine("{0} {1}({2}.Internal native, bool skipVTables = false)",
+                    @class.IsAbstractImpl ? "internal" : "private", @class.Name, className);
+                WriteLineIndent(@class.IsRefType ? ": this(__CopyValue(native), skipVTables)" : ": this()");
                 WriteStartBraceIndent();
-                WriteLine("var {0} = {1};", Generator.GeneratedIdentifier("ptr"), "native");
-                GenerateStructMarshalingFields(@class);
+                if (@class.IsRefType)
+                {
+                    WriteLine("{0} = true;", Helpers.OwnsNativeInstanceIdentifier);
+                    WriteLine("NativeToManagedMap[{0}] = this;", Helpers.InstanceIdentifier);
+                }
+                else
+                {
+                    WriteLine("{0} = native;", Helpers.InstanceField);
+                }
                 WriteCloseBraceIndent();
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
         }
 
-        private bool GenerateClassConstructorBase(Class @class, Method method)
+        private void GenerateClassConstructorBase(Class @class, Method method)
         {
-            var hasBase = @class.HasBaseClass && !@class.Bases[0].Class.Ignore;
+            var hasBase = @class.HasBaseClass;
 
             if (hasBase && !@class.IsValueType)
             {
                 PushIndent();
                 Write(": this(");
 
-                if (method != null)
-                    Write("IntPtr.Zero");
-                else
-                    Write("native");
+                Write(method != null ? "(Internal*) null" : "native");
 
                 WriteLine(")");
                 PopIndent();
@@ -1748,8 +2064,6 @@ namespace CppSharp.Generators.CSharp
 
             if (@class.IsValueType)
                 WriteLineIndent(": this()");
-
-            return hasBase;
         }
 
         #endregion
@@ -1767,7 +2081,10 @@ namespace CppSharp.Generators.CSharp
             WriteLine(")");
             WriteStartBraceIndent();
 
-            GenerateInternalFunctionCall(function);
+            if (function.SynthKind == FunctionSynthKind.DefaultValueOverload)
+                GenerateOverloadCall(function);
+            else
+                GenerateInternalFunctionCall(function);
 
             WriteCloseBraceIndent();
             PopBlock(NewLineKind.BeforeNextBlock);
@@ -1783,8 +2100,13 @@ namespace CppSharp.Generators.CSharp
                 Write(Helpers.GetAccess(GetValidMethodAccess(method)));
             }
 
-            if (method.IsVirtual && !method.IsOverride &&
-                (!Driver.Options.GenerateAbstractImpls || !method.IsPure))
+            // check if overriding a function from a secondary base
+            Method rootBaseMethod;
+            var isOverride = method.IsOverride &&
+                (rootBaseMethod = @class.GetBaseMethod(method, true)) != null &&
+                (rootBaseMethod.IsVirtual || rootBaseMethod.IsPure);
+
+            if (method.IsVirtual && !isOverride && !method.IsOperator && !method.IsPure)
                 Write("virtual ");
 
             var isBuiltinOperator = method.IsOperator &&
@@ -1793,10 +2115,14 @@ namespace CppSharp.Generators.CSharp
             if (method.IsStatic || isBuiltinOperator)
                 Write("static ");
 
-            if (method.IsOverride)
+            if (isOverride)
+            {
+                if (method.Access == AccessSpecifier.Private)
+                    Write("sealed ");
                 Write("override ");
+            }
 
-            if (Driver.Options.GenerateAbstractImpls && method.IsPure)
+            if (method.IsPure)
                 Write("abstract ");
 
             var functionName = GetMethodIdentifier(method);
@@ -1806,7 +2132,8 @@ namespace CppSharp.Generators.CSharp
             else if (method.ExplicitInterfaceImpl != null)
                 Write("{0} {1}.{2}(", method.OriginalReturnType,
                     method.ExplicitInterfaceImpl.Name, functionName);
-            else if (method.OperatorKind == CXXOperatorKind.Conversion)
+            else if (method.OperatorKind == CXXOperatorKind.Conversion || 
+                     method.OperatorKind == CXXOperatorKind.ExplicitConversion)
                 Write("{0} {1}(", functionName, method.OriginalReturnType);
             else
                 Write("{0} {1}(", method.OriginalReturnType, functionName);
@@ -1816,7 +2143,16 @@ namespace CppSharp.Generators.CSharp
 
             Write(")");
 
-            if (Driver.Options.GenerateAbstractImpls && method.IsPure)
+            if (method.SynthKind == FunctionSynthKind.DefaultValueOverload && method.IsConstructor && !method.IsPure)
+            {
+                Write(" : this({0})",
+                    string.Join(", ",
+                        method.Parameters.Where(
+                            p => p.Kind == ParameterKind.Regular).Select(
+                                p => p.Ignore ? p.DefaultArgument.String : p.Name)));
+            }
+
+            if (method.IsPure)
             {
                 Write(";");
                 PopBlock(NewLineKind.BeforeNextBlock);
@@ -1824,13 +2160,23 @@ namespace CppSharp.Generators.CSharp
             }
             NewLine();
 
-            if (method.Kind == CXXMethodKind.Constructor)
+            if (method.Kind == CXXMethodKind.Constructor &&
+                method.SynthKind != FunctionSynthKind.DefaultValueOverload)
                 GenerateClassConstructorBase(@class, method);
 
             WriteStartBraceIndent();
 
             if (method.IsProxy)
                 goto SkipImpl;
+
+            if (method.SynthKind == FunctionSynthKind.DefaultValueOverload)
+            {
+                if (!method.IsConstructor)
+                {
+                    GenerateOverloadCall(method);
+                }
+                goto SkipImpl;
+            }
 
             if (@class.IsRefType)
             {
@@ -1840,11 +2186,15 @@ namespace CppSharp.Generators.CSharp
                 }
                 else if (method.IsOperator)
                 {
-                    GenerateOperator(method, @class);
+                    GenerateOperator(method);
                 }
-                else if (method.IsOverride && method.IsSynthetized)
+                else if (method.SynthKind == FunctionSynthKind.AbstractImplCall)
                 {
-                    GenerateVirtualTableFunctionCall(method, @class);
+                    GenerateVirtualFunctionCall(method, @class.BaseClass);
+                }
+                else if (method.IsVirtual)
+                {
+                    GenerateVirtualFunctionCall(method, @class);
                 }
                 else
                 {
@@ -1859,7 +2209,7 @@ namespace CppSharp.Generators.CSharp
                 }
                 else if (method.IsOperator)
                 {
-                    GenerateOperator(method, @class);
+                    GenerateOperator(method);
                 }
                 else
                 {
@@ -1870,61 +2220,227 @@ namespace CppSharp.Generators.CSharp
             SkipImpl:
 
             WriteCloseBraceIndent();
+
+            if (method.OperatorKind == CXXOperatorKind.EqualEqual)
+            {
+                GenerateEqualsAndGetHashCode(method, @class);
+            }
+
             PopBlock(NewLineKind.BeforeNextBlock);
+        }
+
+        private static string OverloadParamNameWithDefValue(Parameter p, ref int index)
+        {
+            return (p.Type.IsPointerToPrimitiveType() && p.Usage == ParameterUsage.InOut && p.HasDefaultValue)
+                ? "ref param" + index++
+                : p.DefaultArgument.String;
+        }
+
+        private void GenerateOverloadCall(Function function)
+        {
+            for (int i = 0, j = 0; i < function.Parameters.Count; i++)
+            {
+                var parameter = function.Parameters[i];
+                PrimitiveType primitiveType;
+                if (parameter.Kind == ParameterKind.Regular && parameter.Ignore &&
+                    parameter.Type.IsPointerToPrimitiveType(out primitiveType) &&
+                    parameter.Usage == ParameterUsage.InOut && parameter.HasDefaultValue)
+                {
+                    var pointeeType = ((PointerType) parameter.Type).Pointee.ToString();
+                    WriteLine("{0} param{1} = {2};", pointeeType, j++,
+                        primitiveType == PrimitiveType.Bool ? "false" : "0");
+                }
+            }
+
+            GenerateManagedCall(function);
+        }
+
+        private void GenerateManagedCall(Function function, bool prependBase = false)
+        {
+            var type = function.OriginalReturnType.Type;
+            var index = 0;
+            WriteLine("{0}{1}{2}({3});",
+                type.IsPrimitiveType(PrimitiveType.Void) ? string.Empty : "return ",
+                prependBase ? "base." : string.Empty,
+                function.Name,
+                string.Join(", ",
+                    function.Parameters.Where(
+                        p => p.Kind != ParameterKind.IndirectReturnType).Select(
+                            p => p.Ignore ? OverloadParamNameWithDefValue(p, ref index) :
+                                (p.Usage == ParameterUsage.InOut ? "ref " : string.Empty) + p.Name)));
+        }
+
+        private void GenerateEqualsAndGetHashCode(Function method, Class @class)
+        {
+            Class leftHandSide;
+            Class rightHandSide;
+            if (method.Parameters[0].Type.SkipPointerRefs().TryGetClass(out leftHandSide) &&
+                leftHandSide.OriginalPtr == @class.OriginalPtr &&
+                method.Parameters[1].Type.SkipPointerRefs().TryGetClass(out rightHandSide) &&
+                rightHandSide.OriginalPtr == @class.OriginalPtr)
+            {
+                NewLine();
+                WriteLine("public override bool Equals(object obj)");
+                WriteStartBraceIndent();
+                if (@class.IsRefType)
+                {
+                    WriteLine("return this == obj as {0};", @class.Name);
+                }
+                else
+                {
+                    WriteLine("if (!(obj is {0})) return false;", @class.Name);
+                    WriteLine("return this == ({0}) obj;", @class.Name);
+                }
+                WriteCloseBraceIndent();
+
+                NewLine();
+
+                WriteLine("public override int GetHashCode()");
+                WriteStartBraceIndent();
+                if (@class.IsRefType)
+                {
+                    WriteLine("if ({0} == global::System.IntPtr.Zero)", Helpers.InstanceIdentifier);
+                    WriteLineIndent("return global::System.IntPtr.Zero.GetHashCode();");
+                    WriteLine("return (*(Internal*) {0}).GetHashCode();", Helpers.InstanceIdentifier);   
+                }
+                else
+                {
+                    WriteLine("return {0}.GetHashCode();", Helpers.InstanceIdentifier);                       
+                }
+                WriteCloseBraceIndent();
+            }
+        }
+
+        private void CheckArgumentRange(Function method)
+        {
+            if (Driver.Options.MarshalCharAsManagedChar)
+            {
+                foreach (var param in method.Parameters.Where(
+                    p => p.Type.IsPrimitiveType(PrimitiveType.Char)))
+                {
+                    WriteLine("if ({0} < char.MinValue || {0} > sbyte.MaxValue)", param.Name);
+                    WriteLineIndent(
+                        "throw new global::System.ArgumentException(\"{0} must be in the range {1} - {2}.\");",
+                        param.Name, (int) char.MinValue, sbyte.MaxValue);
+                }
+            }
         }
 
         private static AccessSpecifier GetValidMethodAccess(Method method)
         {
-            switch (method.Access)
+            return method.IsOverride
+                ? ((Class) method.Namespace).GetBaseMethod(method).Access
+                : method.Access;
+        }
+
+        private static AccessSpecifier GetValidPropertyAccess(Property property)
+        {
+            switch (property.Access)
             {
                 case AccessSpecifier.Public:
                     return AccessSpecifier.Public;
                 default:
-                    return method.IsOverride ?
-                        ((Class) method.Namespace).GetRootBaseMethod(method).Access : method.Access;
+                    return property.IsOverride ?
+                        ((Class) property.Namespace).GetBaseProperty(property).Access : property.Access;
             }
         }
 
-        private void GenerateVirtualTableFunctionCall(Function method, Class @class)
+        private void GenerateVirtualPropertyCall(Function method, Class @class,
+            Property property, List<Parameter> parameters = null)
         {
-            string delegateId;
-            Write(GetVirtualCallDelegate(method, @class, Driver.Options.Is32Bit, out delegateId));
-            GenerateFunctionCall(delegateId, method.Parameters, method);
+            if (property.IsOverride && !property.IsPure &&
+                method.SynthKind != FunctionSynthKind.AbstractImplCall &&
+                @class.HasNonAbstractBaseProperty(property))
+            {
+                WriteLine(parameters == null ? "return base.{0};" : "base.{0} = value;", property.Name);
+            }
+            else
+            {
+                string delegateId;
+                Write(GetVirtualCallDelegate(method, @class, out delegateId));
+                GenerateFunctionCall(delegateId, parameters ?? method.Parameters, method);
+            }
         }
 
-        public static string GetVirtualCallDelegate(Function method, Class @class,
-            bool is32Bit, out string delegateId)
+        private void GenerateVirtualFunctionCall(Method method, Class @class)
+        {
+            if (method.IsOverride && !method.IsPure &&
+                method.SynthKind != FunctionSynthKind.AbstractImplCall &&
+                @class.HasNonAbstractBaseMethod(method))
+            {
+                GenerateManagedCall(method, true);
+            }
+            else
+            {
+                string delegateId;
+                Write(GetVirtualCallDelegate(method, @class, out delegateId));
+                GenerateFunctionCall(delegateId, method.Parameters, method);
+            }
+        }
+
+        public string GetVirtualCallDelegate(Function function, Class @class,
+            out string delegateId)
         {
             var virtualCallBuilder = new StringBuilder();
-            virtualCallBuilder.AppendFormat("void* vtable = *((void**) {0}.ToPointer());",
-                Helpers.InstanceIdentifier);
+            var i = VTables.GetVTableIndex(function.OriginalFunction ?? function, @class);
+            virtualCallBuilder.AppendFormat("var {0} = *(void**) ((IntPtr) __OriginalVTables[0] + {1} * {2});",
+                Helpers.SlotIdentifier, i, Driver.TargetInfo.PointerWidth / 8);
             virtualCallBuilder.AppendLine();
 
-            var i = VTables.GetVTableIndex(method, @class);
-
-            virtualCallBuilder.AppendFormat(
-                "void* slot = *((void**) vtable + {0} * {1});", i, is32Bit ? 4 : 8);
-            virtualCallBuilder.AppendLine();
-
-            string @delegate = ASTHelpers.GetDelegateName(method);
+            var @delegate = GetVTableMethodDelegateName(function.OriginalFunction ?? function);
             delegateId = Generator.GeneratedIdentifier(@delegate);
 
             virtualCallBuilder.AppendFormat(
-                "var {1} = ({0}) Marshal.GetDelegateForFunctionPointer(new IntPtr(slot), typeof({0}));",
-                @delegate, delegateId);
+                "var {1} = ({0}) Marshal.GetDelegateForFunctionPointer(new IntPtr({2}), typeof({0}));",
+                @delegate, delegateId, Helpers.SlotIdentifier);
+
             virtualCallBuilder.AppendLine();
             return virtualCallBuilder.ToString();
         }
 
-        private void GenerateOperator(Method method, Class @class)
+        private void GenerateOperator(Method method)
         {
-            if (method.IsSynthetized)
+            if (method.SynthKind == FunctionSynthKind.ComplementOperator)
             {
-                var @operator = Operators.GetOperatorOverloadPair(method.OperatorKind);
+                if (method.Kind == CXXMethodKind.Conversion)
+                {
+                    // To avoid ambiguity when having the multiple inheritance pass enabled
+                    var paramType = method.Parameters[0].Type.SkipPointerRefs().Desugar();
+                    Class paramClass;
+                    Class @interface = null;
+                    if (paramType.TryGetClass(out paramClass))
+                        @interface = paramClass.Namespace.Classes.Find(c => c.OriginalClass == paramClass);
 
-                WriteLine("return !({0} {1} {2});", method.Parameters[0].Name,
-                          @operator, method.Parameters[1].Name);
+                    var paramName = string.Format("{0}{1}",
+                        method.Parameters[0].Type.IsPrimitiveTypeConvertibleToRef() ?
+                        "ref *" : string.Empty,
+                        method.Parameters[0].Name);
+                    if (@interface != null)
+                        WriteLine("return new {0}(({2}) {1});",
+                            method.ConversionType, paramName, @interface.Name);
+                    else
+                        WriteLine("return new {0}({1});", method.ConversionType, paramName);
+                }
+                else
+                {
+                    var @operator = Operators.GetOperatorOverloadPair(method.OperatorKind);
+
+                    WriteLine("return !({0} {1} {2});", method.Parameters[0].Name,
+                              @operator, method.Parameters[1].Name);
+                }
                 return;
+            }
+
+            if (method.OperatorKind == CXXOperatorKind.EqualEqual)
+            {
+                WriteLine("bool {0}Null = ReferenceEquals({0}, null);",
+                    method.Parameters[0].Name);
+                WriteLine("bool {0}Null = ReferenceEquals({0}, null);",
+                    method.Parameters[1].Name);
+                WriteLine("if ({0}Null || {1}Null)",
+                    method.Parameters[0].Name, method.Parameters[1].Name);
+                WriteLineIndent("return {0}Null && {1}Null;",
+                    method.Parameters[0].Name, method.Parameters[1].Name);
             }
 
             GenerateInternalFunctionCall(method);
@@ -1934,26 +2450,40 @@ namespace CppSharp.Generators.CSharp
         {
             WriteLine("{0} = Marshal.AllocHGlobal({1});", Helpers.InstanceIdentifier,
                 @class.Layout.Size);
+            WriteLine("{0} = true;", Helpers.OwnsNativeInstanceIdentifier);
+            WriteLine("NativeToManagedMap[{0}] = this;", Helpers.InstanceIdentifier);
 
-            if (!method.IsDefaultConstructor || @class.HasNonTrivialDefaultConstructor)
-                GenerateInternalFunctionCall(method);
+            if (method.IsCopyConstructor)
+            {
+                if (@class.HasNonTrivialCopyConstructor)
+                    GenerateInternalFunctionCall(method);
+                else
+                    WriteLine("*(({0}.Internal*) {2}) = *(({0}.Internal*) {1}.{2});",
+                        @class.Name, method.Parameters[0].Name, Helpers.InstanceIdentifier);
+            }
+            else
+            {
+                if (!method.IsDefaultConstructor || @class.HasNonTrivialDefaultConstructor)
+                    GenerateInternalFunctionCall(method);
+            }
 
             GenerateVTableClassSetupCall(@class);
         }
 
         public void GenerateInternalFunctionCall(Function function,
-            List<Parameter> parameters = null)
+            List<Parameter> parameters = null, Type returnType = null)
         {
             if (parameters == null)
                 parameters = function.Parameters;
 
+            CheckArgumentRange(function);
             var functionName = string.Format("Internal.{0}",
-                GetFunctionNativeIdentifier(function));
-            GenerateFunctionCall(functionName, parameters, function);
+                GetFunctionNativeIdentifier(function.OriginalFunction ?? function));
+            GenerateFunctionCall(functionName, parameters, function, returnType);
         }
 
         public void GenerateFunctionCall(string functionName, List<Parameter> parameters,
-            Function function)
+            Function function, Type returnType = null)
         {
             if (function.IsPure)
             {
@@ -1962,12 +2492,16 @@ namespace CppSharp.Generators.CSharp
             }
 
             var retType = function.OriginalReturnType;
-            var needsReturn = !retType.Type.IsPrimitiveType(PrimitiveType.Void);
+            if (returnType == null)
+                returnType = retType.Type;
+
+            var method = function as Method;
+            var hasThisReturnStructor = method != null && (method.IsConstructor || method.IsDestructor);
+            var needsReturn = !retType.Type.IsPrimitiveType(PrimitiveType.Void) && !hasThisReturnStructor;
 
             var isValueType = false;
             var needsInstance = false;
 
-            var method = function as Method;
             Parameter operatorParam = null;
             if (method != null)
             {
@@ -1979,21 +2513,40 @@ namespace CppSharp.Generators.CSharp
                 needsInstance = !method.IsStatic || operatorParam != null;
             }
 
-            var needsFixedThis = needsInstance && isValueType;
             var @params = GenerateFunctionParamsMarshal(parameters, function);
 
             var originalFunction = function.OriginalFunction ?? function;
 
             if (originalFunction.HasIndirectReturnTypeParameter)
             {
-                var hiddenParam = originalFunction.Parameters[0];
-                if (hiddenParam.Kind != ParameterKind.IndirectReturnType)
-                    throw new NotSupportedException("Expected hidden structure parameter kind");
+                var indirectRetType = originalFunction.Parameters.First(
+                    parameter => parameter.Kind == ParameterKind.IndirectReturnType);
 
                 Class retClass;
-                hiddenParam.Type.Desugar().IsTagDecl(out retClass);
-                WriteLine("var {0} = new {1}.Internal();", GeneratedIdentifier("ret"),
-                    QualifiedIdentifier(retClass.OriginalClass ?? retClass));
+                indirectRetType.Type.Desugar().TryGetClass(out retClass);
+
+                TypeMap typeMap;
+                string construct = null;
+                if (Driver.TypeDatabase.FindTypeMap(retClass, out typeMap))
+                    construct = typeMap.CSharpConstruct();
+
+                if (construct == null)
+                {
+                    WriteLine("var {0} = new {1}.Internal();", Helpers.ReturnIdentifier,
+                        QualifiedIdentifierIfNeeded(retClass.OriginalClass ?? retClass));
+                }
+                else
+                {
+                    if (string.IsNullOrWhiteSpace(construct))
+                        WriteLine("{0} {1};",
+                            typeMap.CSharpSignature(new CSharpTypePrinterContext
+                            {
+                                Type = indirectRetType.Type.Desugar()
+                            }),
+                            Helpers.ReturnIdentifier);
+                    else
+                        WriteLine("var {0} = {1};", construct);
+                }
             }
 
             var names = new List<string>();
@@ -2002,49 +2555,59 @@ namespace CppSharp.Generators.CSharp
                 if (param.Param == operatorParam && needsInstance)
                     continue;
 
-                var name = string.Empty;
+                var name = new StringBuilder();
                 if (param.Context != null
                     && !string.IsNullOrWhiteSpace(param.Context.ArgumentPrefix))
-                    name += param.Context.ArgumentPrefix;
+                    name.Append(param.Context.ArgumentPrefix);
 
-                name += Helpers.SafeIdentifier(param.Name);
-                names.Add(name);
+                name.Append(param.Name);
+                names.Add(name.ToString());
             }
+
+            var needsFixedThis = needsInstance && isValueType;
 
             if (originalFunction.HasIndirectReturnTypeParameter)
             {
-                var name = string.Format("new IntPtr(&{0})", GeneratedIdentifier("ret"));
+                var name = string.Format("new IntPtr(&{0})", Helpers.ReturnIdentifier);
                 names.Insert(0, name);
             }
 
             if (needsInstance)
             {
+                var instanceIndex = GetInstanceParamIndex(method);
+
                 if (needsFixedThis)
                 {
-                    names.Insert(0, string.Format("new global::System.IntPtr(&{0})",
-                        GeneratedIdentifier("fixedInstance")));
+                    names.Insert(instanceIndex, "new global::System.IntPtr(__instancePtr)");
                 }
                 else
                 {
                     if (operatorParam != null)
                     {
-                        names.Insert(0, operatorParam.Name + "." + Helpers.InstanceIdentifier);
+                        names.Insert(instanceIndex, @params[0].Name);
                     }
                     else
                     {
-                        names.Insert(0, Helpers.InstanceIdentifier);
+                        names.Insert(instanceIndex, GetInstanceParam(function));
                     }
                 }
             }
 
             if (needsFixedThis)
             {
-                WriteLine("var {0} = {1};", Generator.GeneratedIdentifier("fixedInstance"),
-                    method.IsOperator ? "__arg0" : "ToInternal()");
+                if (operatorParam == null)
+                {
+                    WriteLine("fixed (Internal* __instancePtr = &{0})", Helpers.InstanceField);
+                    WriteStartBraceIndent();
+                }
+                else
+                {
+                    WriteLine("var __instancePtr = &{0}.{1};", operatorParam.Name, Helpers.InstanceField);
+                }
             }
 
             if (needsReturn && !originalFunction.HasIndirectReturnTypeParameter)
-                Write("var {0} = ", GeneratedIdentifier("ret"));
+                Write("var {0} = ", Helpers.ReturnIdentifier);
 
             WriteLine("{0}({1});", functionName, string.Join(", ", names));
 
@@ -2053,7 +2616,8 @@ namespace CppSharp.Generators.CSharp
 
             cleanups.AddRange(
                 from param in @params
-                select param.Context into context
+                select param.Context
+                into context
                 where context != null && !string.IsNullOrWhiteSpace(context.Cleanup)
                 select context.Cleanup);
 
@@ -2062,53 +2626,14 @@ namespace CppSharp.Generators.CSharp
                 Write(cleanup);
             }
 
-            if (needsFixedThis)
-            {
-                if (operatorParam != null)
-                {
-                    WriteLine("{0}.FromInternal(&{1});",
-                        operatorParam.Name, Generator.GeneratedIdentifier("fixedInstance"));
-                }
-                else
-                {
-                    WriteLine("FromInternal(&{0});", Generator.GeneratedIdentifier("fixedInstance"));
-                }
-            }
-
             if (needsReturn)
             {
-                TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
-                var retTypeName = retType.CSharpType(TypePrinter).Type;
-                TypePrinter.PopContext();
-
-                var isIntPtr = retTypeName.Contains("IntPtr");
-
-                Type pointee;
-                if (retType.Type.IsPointerTo(out pointee) && isIntPtr)
-                {
-                    pointee = pointee.Desugar();
-                    string @null;
-                    Class @class;
-                    if (pointee.IsTagDecl(out @class) && @class.IsValueType)
-                    {
-                        @null = string.Format("new {0}()", pointee);
-                    }
-                    else
-                    {
-                        @null = (pointee.IsPrimitiveType() ||
-                            pointee.IsPointer()) &&
-                            !CSharpTypePrinter.IsConstCharString(retType) ?
-                            "IntPtr.Zero" : "null";
-                    }
-                    WriteLine("if ({0} == global::System.IntPtr.Zero) return {1};",
-                        Generator.GeneratedIdentifier("ret"), @null);
-                }
-
                 var ctx = new CSharpMarshalContext(Driver)
                 {
-                    ArgName = GeneratedIdentifier("ret"),
-                    ReturnVarName = GeneratedIdentifier("ret"),
-                    ReturnType = retType
+                    ArgName = Helpers.ReturnIdentifier,
+                    ReturnVarName = Helpers.ReturnIdentifier,
+                    ReturnType = retType,
+                    Parameter = operatorParam
                 };
 
                 var marshal = new CSharpMarshalNativeToManagedPrinter(ctx);
@@ -2117,11 +2642,59 @@ namespace CppSharp.Generators.CSharp
                 if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
                     Write(marshal.Context.SupportBefore);
 
-                WriteLine(
-                    TypePrinter.ContextKind == CSharpTypePrinterContextKind.PrimitiveIndexer
-                        ? "return *{0};"
-                        : "return {0};", marshal.Context.Return);
+                // Special case for indexer - needs to dereference if the internal
+                // function is a pointer type and the property is not.
+                if (retType.Type.IsAddress() &&
+                    retType.Type.GetPointee().Equals(returnType) &&
+                    returnType.IsPrimitiveType())
+                    WriteLine("return *{0};", marshal.Context.Return);
+                else
+                    WriteLine("return {0};", marshal.Context.Return);
             }
+
+            if (needsFixedThis && operatorParam == null)
+                WriteCloseBraceIndent();
+            
+            var numFixedBlocks = @params.Count(param => param.HasFixedBlock);
+            for(var i = 0; i < numFixedBlocks; ++i)
+                WriteCloseBraceIndent();
+        }
+
+        private static string GetInstanceParam(Function function)
+        {
+            var from = (Class) function.Namespace;
+            var to = function.OriginalFunction == null ? @from.BaseClass :
+                (Class) function.OriginalFunction.Namespace;
+
+            var baseOffset = 0;
+            if (to != null)
+            {
+                to = to.OriginalClass ?? to;
+                baseOffset = @from.ComputeNonVirtualBaseClassOffsetTo(to);
+            }
+            var isPrimaryBase = from.BaseClass == to;
+            if (isPrimaryBase)
+            {
+                return string.Format("({0} + {1}{2})",
+                    Helpers.InstanceIdentifier,
+                    Helpers.PointerAdjustmentIdentifier,
+                    baseOffset == 0 ? string.Empty : (" - " + baseOffset));
+            }
+            return string.Format("({0}{1})",
+                Helpers.InstanceIdentifier,
+                baseOffset == 0 ? string.Empty : " + " + baseOffset);
+        }
+
+        private int GetInstanceParamIndex(Function method)
+        {
+            if (Options.IsMicrosoftAbi)
+                return 0;
+
+            var indirectReturnType = method.Parameters.FirstOrDefault(
+                parameter => parameter.Kind == ParameterKind.IndirectReturnType);
+            var indirectReturnTypeIndex = method.Parameters.IndexOf(indirectReturnType);
+
+            return indirectReturnTypeIndex >= 0 ? ++indirectReturnTypeIndex : 0;
         }
 
         private void GenerateFunctionCallOutParams(IEnumerable<ParamMarshal> @params,
@@ -2131,6 +2704,8 @@ namespace CppSharp.Generators.CSharp
             {
                 var param = paramInfo.Param;
                 if (!(param.IsOut || param.IsInOut)) continue;
+                if (param.Type.IsPrimitiveTypeConvertibleToRef())
+                    continue;
 
                 var nativeVarName = paramInfo.Name;
 
@@ -2150,19 +2725,9 @@ namespace CppSharp.Generators.CSharp
 
                 WriteLine("{0} = {1};", param.Name, marshal.Context.Return);
 
-                if (!string.IsNullOrWhiteSpace(marshal.CSharpContext.Cleanup))
-                    cleanups.Add(marshal.CSharpContext.Cleanup);
+                if (!string.IsNullOrWhiteSpace(marshal.Context.Cleanup))
+                    cleanups.Add(marshal.Context.Cleanup);
             }
-        }
-
-        private static bool IsInstanceFunction(Function function)
-        {
-            var isInstanceFunction = false;
-
-            var method = function as Method;
-            if (method != null)
-                isInstanceFunction = method.Conversion == MethodConversionKind.None;
-            return isInstanceFunction;
         }
 
         public struct ParamMarshal
@@ -2170,6 +2735,7 @@ namespace CppSharp.Generators.CSharp
             public string Name;
             public Parameter Param;
             public CSharpMarshalContext Context;
+            public bool HasFixedBlock;
         }
 
         public List<ParamMarshal> GenerateFunctionParamsMarshal(IEnumerable<Parameter> @params,
@@ -2193,9 +2759,12 @@ namespace CppSharp.Generators.CSharp
         private ParamMarshal GenerateFunctionParamMarshal(Parameter param, int paramIndex,
             Function function = null)
         {
-            if (param.Type is BuiltinType)
+            PrimitiveType primitive;
+            // Do not delete instance in MS ABI.
+            var name = param.Kind == ParameterKind.ImplicitDestructorParameter ? "0" : param.Name;
+            if (param.Type.IsPrimitiveType(out primitive) && primitive != PrimitiveType.Char)
             {
-                return new ParamMarshal { Name = param.Name, Param = param };
+                return new ParamMarshal { Name = name, Param = param };
             }
 
             var argName = "arg" + paramIndex.ToString(CultureInfo.InvariantCulture);
@@ -2206,9 +2775,11 @@ namespace CppSharp.Generators.CSharp
                 var paramType = param.Type;
 
                 Class @class;
-                if (paramType.Desugar().IsTagDecl(out @class) && @class.IsRefType)
+                if ((paramType.GetFinalPointee() ?? paramType).Desugar().TryGetClass(out @class))
                 {
-                    WriteLine("{0} = new {1}();", param.Name, paramType);
+                    var qualifiedIdentifier = CSharpMarshalNativeToManagedPrinter.QualifiedIdentifier(
+                        @class.OriginalClass ?? @class);
+                    WriteLine("{0} = new {1}();", name, qualifiedIdentifier);
                 }
             }
 
@@ -2221,9 +2792,9 @@ namespace CppSharp.Generators.CSharp
             };
 
             paramMarshal.Context = ctx;
-
             var marshal = new CSharpMarshalManagedToNativePrinter(ctx);
             param.CSharpMarshalToNative(marshal);
+            paramMarshal.HasFixedBlock = ctx.HasFixedBlock;
 
             if (string.IsNullOrEmpty(marshal.Context.Return))
                 throw new Exception("Cannot marshal argument of function");
@@ -2231,7 +2802,10 @@ namespace CppSharp.Generators.CSharp
             if (!string.IsNullOrWhiteSpace(marshal.Context.SupportBefore))
                 Write(marshal.Context.SupportBefore);
 
-            WriteLine("var {0} = {1};", SafeIdentifier(argName), marshal.Context.Return);
+            if (paramMarshal.HasFixedBlock)
+                PushIndent();
+
+            WriteLine("var {0} = {1};", argName, marshal.Context.Return);
 
             return paramMarshal;
         }
@@ -2243,7 +2817,7 @@ namespace CppSharp.Generators.CSharp
                 case ParameterUsage.Out:
                     return "out ";
                 case ParameterUsage.InOut:
-                    return "ref";
+                    return "ref ";
                 default:
                     return string.Empty;
             }
@@ -2253,17 +2827,19 @@ namespace CppSharp.Generators.CSharp
         {
             return string.Join(", ",
                 from param in @params
-                where param.Kind != ParameterKind.IndirectReturnType
+                where param.Kind != ParameterKind.IndirectReturnType && !param.Ignore
                 let typeName = param.CSharpType(TypePrinter)
                 select string.Format("{0}{1} {2}", GetParameterUsage(param.Usage),
-                    typeName, SafeIdentifier(param.Name)));
+                    typeName, param.Name +
+                        (param.DefaultArgument == null || !Options.GenerateDefaultValuesForArguments ?
+                            string.Empty : " = " + param.DefaultArgument.String)));
         }
 
         #endregion
 
         public bool GenerateTypedef(TypedefDecl typedef)
         {
-            if (typedef.Ignore)
+            if (!typedef.IsGenerated)
                 return false;
 
             GenerateDeclarationCommon(typedef);
@@ -2275,19 +2851,26 @@ namespace CppSharp.Generators.CSharp
                 || typedef.Type.IsPointerTo(out tag))
             {
                 PushBlock(CSharpBlockKind.Typedef);
-                WriteLine("public class " + SafeIdentifier(typedef.Name) + @" { }");
+                WriteLine("public class " + typedef.Name + @" { }");
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
             else if (typedef.Type.IsPointerTo(out functionType))
             {
                 PushBlock(CSharpBlockKind.Typedef);
-                WriteLine("[UnmanagedFunctionPointerAttribute(global::System.Runtime.InteropServices.CallingConvention.{0})]",
-                    Helpers.ToCSharpCallConv(functionType.CallingConvention));
+                var attributedType = typedef.Type.GetPointee() as AttributedType;
+                var callingConvention = attributedType == null
+                    ? functionType.CallingConvention
+                    : ((FunctionType) attributedType.Equivalent.Type).CallingConvention;
                 TypePrinter.PushContext(CSharpTypePrinterContextKind.Native);
+                var interopCallConv = callingConvention.ToInteropCallConv();
+                if (interopCallConv != System.Runtime.InteropServices.CallingConvention.Winapi)
+                    WriteLine(
+                        "[UnmanagedFunctionPointerAttribute(global::System.Runtime.InteropServices.CallingConvention.{0})]",
+                        interopCallConv);
                 WriteLine("{0}unsafe {1};",
                     Helpers.GetAccess(typedef.Access),
                     string.Format(TypePrinter.VisitDelegate(functionType).Type,
-                        SafeIdentifier(typedef.Name)));
+                        typedef.Name));
                 TypePrinter.PopContext();
                 PopBlock(NewLineKind.BeforeNextBlock);
             }
@@ -2297,7 +2880,7 @@ namespace CppSharp.Generators.CSharp
 
         public void GenerateEnum(Enumeration @enum)
         {
-            if (@enum.Ignore) return;
+            if (!@enum.IsGenerated) return;
 
             PushBlock(CSharpBlockKind.Enum);
             GenerateDeclarationCommon(@enum);
@@ -2305,12 +2888,12 @@ namespace CppSharp.Generators.CSharp
             if (@enum.IsFlags)
                 WriteLine("[Flags]");
 
-            Write("public enum {0}", SafeIdentifier(@enum.Name));
+            Write("public enum {0}", @enum.Name);
 
             var typeName = TypePrinter.VisitPrimitiveType(@enum.BuiltinType.Type,
                                                           new TypeQualifiers());
 
-            if (@enum.BuiltinType.Type != PrimitiveType.Int32)
+            if (@enum.BuiltinType.Type != PrimitiveType.Int)
                 Write(" : {0}", typeName);
 
             NewLine();
@@ -2323,8 +2906,8 @@ namespace CppSharp.Generators.CSharp
 
                 var value = @enum.GetItemValueAsString(item);
                 Write(item.ExplicitValue
-                          ? string.Format("{0} = {1}", SafeIdentifier(item.Name), value)
-                          : string.Format("{0}", SafeIdentifier(item.Name)));
+                          ? string.Format("{0} = {1}", item.Name, value)
+                          : string.Format("{0}", item.Name));
 
                 if (i < @enum.Items.Count - 1)
                     Write(",");
@@ -2349,7 +2932,7 @@ namespace CppSharp.Generators.CSharp
             if (function.IsOperator)
                 return Operators.GetOperatorIdentifier(function.OperatorKind);
 
-            return SafeIdentifier(function.Name);
+            return function.Name;
         }
 
         public static string GetFunctionNativeIdentifier(Function function)
@@ -2359,7 +2942,7 @@ namespace CppSharp.Generators.CSharp
             var method = function as Method;
             if (method != null)
             {
-                if (method.IsConstructor)
+                if (method.IsConstructor && !method.IsCopyConstructor)
                     functionName = "ctor";
                 else if (method.IsCopyConstructor)
                     functionName = "cctor";
@@ -2369,24 +2952,26 @@ namespace CppSharp.Generators.CSharp
                     functionName = GetMethodIdentifier(method);
             }
 
-            var identifier = SafeIdentifier(functionName);
+            var identifier = functionName;
 
             if (function.IsOperator)
                 identifier = "Operator" + function.OperatorKind;
 
-            var overloads = function.Namespace.GetFunctionOverloads(function)
+            var overloads = function.Namespace.GetOverloads(function)
                 .ToList();
             var index = overloads.IndexOf(function);
 
             if (index >= 0)
                 identifier += "_" + index.ToString(CultureInfo.InvariantCulture);
+            else if (function.Index.HasValue)
+                identifier += "_" + function.Index.Value;
 
             return identifier;
         }
 
         public void GenerateInternalFunction(Function function)
         {
-            if (!function.IsProcessed || function.ExplicityIgnored || function.IsPure)
+            if (function.IsPure)
                 return;
 
             if (function.OriginalFunction != null)
@@ -2402,9 +2987,10 @@ namespace CppSharp.Generators.CSharp
                 NativeLibrary library;
                 Driver.Symbols.FindLibraryBySymbol(function.Mangled, out library);
 
-                libName = Path.GetFileNameWithoutExtension(library.FileName);
+                if (library != null)
+                    libName = Path.GetFileNameWithoutExtension(library.FileName);
             }
-            if (libName != null && libName.Length > 3 && libName.StartsWith("lib"))
+            if (Options.StripLibPrefix && libName != null && libName.Length > 3 && libName.StartsWith("lib"))
             {
                 libName = libName.Substring(3);
             }
@@ -2416,58 +3002,22 @@ namespace CppSharp.Generators.CSharp
 
             Write("[DllImport(\"{0}\", ", libName);
 
-            var callConv = Helpers.ToCSharpCallConv(function.CallingConvention);
+            var callConv = function.CallingConvention.ToInteropCallConv();
             WriteLine("CallingConvention = global::System.Runtime.InteropServices.CallingConvention.{0},",
                 callConv);
 
             WriteLineIndent("EntryPoint=\"{0}\")]", function.Mangled);
 
-            if (function.ReturnType.Type.Desugar().IsPrimitiveType(PrimitiveType.Bool))
+            if (function.ReturnType.Type.IsPrimitiveType(PrimitiveType.Bool))
                 WriteLine("[return: MarshalAsAttribute(UnmanagedType.I1)]");
 
-            var @params = new List<string>();
-
-            var typePrinter = TypePrinter as CSharpTypePrinter;
-            typePrinter.PushContext(CSharpTypePrinterContextKind.Native);
-
-            var retParam = new Parameter { QualifiedType = function.ReturnType };
-            var retType = retParam.CSharpType(typePrinter);
-
-            var method = function as Method;
-            if (method != null && !method.IsStatic)
-            {
-                @params.Add("global::System.IntPtr instance");
-
-                if (method.IsConstructor && Options.IsMicrosoftAbi)
-                    retType = "global::System.IntPtr";
-            }
-
-            foreach (var param in function.Parameters)
-            {
-                if (param.Kind == ParameterKind.OperatorParameter)
-                    continue;
-
-                var typeName = param.CSharpType(typePrinter);
-
-                var paramName = param.IsSynthetized ?
-                    GeneratedIdentifier(param.Name) : SafeIdentifier(param.Name);
-
-                @params.Add(string.Format("{0} {1}", typeName, paramName));
-            }
-
-            if (method != null && method.IsConstructor)
-            {
-                var @class = method.Namespace as Class;
-                if (Options.IsMicrosoftAbi && @class.Layout.HasVirtualBases)
-                    @params.Add("int " + GeneratedIdentifier("forBases"));
-            }
+            CSharpTypePrinterResult retType;
+            var @params = GatherInternalParams(function, out retType);
 
             WriteLine("internal static extern {0} {1}({2});", retType,
                       GetFunctionNativeIdentifier(function),
                       string.Join(", ", @params));
             PopBlock(NewLineKind.BeforeNextBlock);
-
-            typePrinter.PopContext();
         }
     }
 

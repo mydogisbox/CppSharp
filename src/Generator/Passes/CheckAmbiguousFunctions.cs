@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using CppSharp.AST;
 
 namespace CppSharp.Passes
@@ -31,25 +32,25 @@ namespace CppSharp.Passes
             if (function.IsAmbiguous)
                 return false;
 
-            var overloads = function.Namespace.GetFunctionOverloads(function);
+            var overloads = function.Namespace.GetOverloads(function);
 
             foreach (var overload in overloads)
             {
                 if (function.OperatorKind == CXXOperatorKind.Conversion)
                     continue;
+                if (function.OperatorKind == CXXOperatorKind.ExplicitConversion)
+                    continue;
 
                 if (overload == function) continue;
 
-                if (overload.Ignore) continue;
+                if (!overload.IsGenerated) continue;
 
-                if (!CheckDefaultParameters(function, overload))
-                    continue;
-
-                if (!CheckConstness(function, overload))
-                    continue;
-
-                function.IsAmbiguous = true;
-                overload.IsAmbiguous = true;
+                if (CheckConstnessForAmbiguity(function, overload) ||
+                    CheckDefaultParametersForAmbiguity(function, overload))
+                {
+                    function.IsAmbiguous = true;
+                    overload.IsAmbiguous = true;
+                }
             }
 
             if (function.IsAmbiguous)
@@ -59,7 +60,7 @@ namespace CppSharp.Passes
             return true;
         }
 
-        static bool CheckDefaultParameters(Function function, Function overload)
+        private static bool CheckDefaultParametersForAmbiguity(Function function, Function overload)
         {
             var commonParameters = Math.Min(function.Parameters.Count, overload.Parameters.Count);
 
@@ -88,34 +89,36 @@ namespace CppSharp.Passes
             }
 
             if (function.Parameters.Count > overload.Parameters.Count)
-                overload.ExplicityIgnored = true;
+                overload.ExplicitlyIgnore();
             else
-                function.ExplicityIgnored = true;
+                function.ExplicitlyIgnore();
 
             return true;
         }
 
-        static bool CheckConstness(Function function, Function overload)
+        private static bool CheckConstnessForAmbiguity(Function function, Function overload)
         {
             if (function is Method && overload is Method)
             {
                 var method1 = function as Method;
                 var method2 = overload as Method;
 
-                if (method1.IsConst && !method2.IsConst)
+                var sameParams = method1.Parameters.SequenceEqual(method2.Parameters, new ParameterTypeComparer());
+
+                if (method1.IsConst && !method2.IsConst && sameParams)
                 {
-                    method1.ExplicityIgnored = true;
-                    return false;
+                    method1.ExplicitlyIgnore();
+                    return true;
                 }
 
-                if (method2.IsConst && !method1.IsConst)
+                if (method2.IsConst && !method1.IsConst && sameParams)
                 {
-                    method2.ExplicityIgnored = true;
-                    return false;
+                    method2.ExplicitlyIgnore();
+                    return true;
                 }
             }
 
-            return true;
+            return false;
         }
     }
 }

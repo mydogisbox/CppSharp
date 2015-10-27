@@ -4,41 +4,146 @@ From an higher level overview, CppSharp will take a bunch of user-provided C/C++
 headers and generate either C++/CLI or C# code that can be compiled into a
 regular .NET assembly.
 
-Since there are no binary releases yet, the project needs to be compiled from
-source first.
+To get started you can either compile from source or get one of the pre-compiled binary releases from the [releases archive](https://github.com/mono/CppSharp/releases).
 
-## Compiling on Windows/Visual Studio
+# Building from source
+
+## LLVM/Clang source repositories ##
+
+SVN repository urls found here: [http://clang.llvm.org/get_started.html](http://clang.llvm.org/get_started.html)
+
+Git repository urls found here: [http://llvm.org/docs/GettingStarted.html#git-mirror](http://llvm.org/docs/GettingStarted.html#git-mirror)
+
+## Common setup
 
 1. Clone CppSharp to `<CppSharp>`
 2. Clone LLVM to `<CppSharp>\deps\llvm`
-3. Clone Clang to `<CppSharp>\deps\llvm\tools\clang` (see:
-   [http://clang.llvm.org/get_started.html](http://clang.llvm.org/get_started.html))
-4. Run CMake in `<CppSharp>\deps\llvm` and compile solution in *RelWithDebInfo* mode
-5. Run `GenerateProjects.bat` in <CppSharp>\build
-6. Build generated solution in *Release*.
+3. Clone Clang to `<CppSharp>\deps\llvm\tools\clang`
+4. Create directory `<CppSharp>\deps\llvm\build`
+
+Required LLVM/Clang commits:
+
+[LLVM: see /build/LLVM-commit.](https://github.com/mono/CppSharp/tree/master/build/LLVM-commit)
+
+[Clang: see /build/Clang-commit.](https://github.com/mono/CppSharp/tree/master/build/Clang-commit)
+
+## Compiling on Windows/Visual Studio
+
+### Compiling LLVM on Windows/Visual Studio (32-bit binaries)
+
+```shell
+cd <CppSharp>\deps\llvm\build
+
+cmake -G "Visual Studio 12" -DCLANG_BUILD_EXAMPLES=false -DCLANG_INCLUDE_DOCS=false -DCLANG_INCLUDE_TESTS=false -DCLANG_INCLUDE_DOCS=false -DCLANG_BUILD_EXAMPLES=false -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_INCLUDE_EXAMPLES=false -DLLVM_INCLUDE_DOCS=false -DLLVM_INCLUDE_TESTS=false ..
+
+msbuild LLVM.sln /p:Configuration=RelWithDebInfo;Platform=Win32 /m
+```
+
+OR, if you need 64-bit binaries:
+
+```shell
+cd <CppSharp>\deps\llvm\build
+
+cmake -G "Visual Studio 12 Win64" -DCLANG_BUILD_EXAMPLES=false -DCLANG_INCLUDE_DOCS=false -DCLANG_INCLUDE_TESTS=false -DCLANG_INCLUDE_DOCS=false -DCLANG_BUILD_EXAMPLES=false -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_INCLUDE_EXAMPLES=false -DLLVM_INCLUDE_DOCS=false -DLLVM_INCLUDE_TESTS=false ..
+
+msbuild LLVM.sln /p:Configuration=RelWithDebInfo;Platform=x64 /m
+```
+
+### Compiling CppSharp on Windows/Visual Studio
+
+```shell
+cd <CppSharp>\build
+
+generateprojects.bat
+msbuild vs2013\CppSharp.sln /p:Configuration=Release;Platform=x86
+```
 
 Building in *Release* is recommended because else the Clang parser will be
 excruciatingly slow.
 
-Last updated to LLVM/Clang revision: `r198449`
+It has been reported that running the solution upgrade process under VS 2013 breaks the build due
+to an incompatibility of .NET versions between projects (4.5 and 4.0). If you experience this
+problem you can change the targetted .NET version of the projects to be the same or just do not
+run the upgrade process after generation. 
 
-## Compiling on Mac OS X (experimental)
+## Compiling on Mac OS X
 
-Requirements: Clang revision >= 198625
+### Compiling LLVM on Mac OS X
 
-1. Clone CppSharp to `<CppSharp>`
-2. Clone LLVM to `<CppSharp>\deps\llvm`
-3. Clone Clang to `<CppSharp>\deps\llvm\tools\clang` (see:
-   [http://clang.llvm.org/get_started.html](http://clang.llvm.org/get_started.html))
-4. Run CMake in `<CppSharp>\deps\llvm` and compile solution in *RelWithDebInfo* mode
+1. Compile LLVM solution in *RelWithDebInfo* mode
    The following CMake variables should be enabled:
-    - LLVM_ENABLE_CXX11 (enables C++11 support)
     - LLVM_ENABLE_LIBCXX (enables libc++ standard library support)
     - LLVM_BUILD_32_BITS for 32-bit builds (defaults to 64-bit)
-5. Run `premake5 gmake` in <CppSharp>\build
-6. Build generated makefiles:
+
+```shell
+mkdir -p deps/llvm/build && cd deps/llvm/build
+
+cmake -G "Unix Makefiles" -DLLVM_ENABLE_LIBCXX=true -DLLVM_BUILD_32_BITS=true -DCMAKE_BUILD_TYPE=RelWithDebInfo ..
+
+make
+```
+
+### Compiling CppSharp on Mac OS X
+
+1. Run `premake5-osx gmake` in <CppSharp>\build
+2. Build generated makefiles:
     - 32-bit builds: `config=release_x32 make`
     - 64-bit builds: `config=release_x64 make`
+
+The version you compile needs to match the version of the Mono VM installed on your system which you can find by running `mono --version`. The reason for this is because a 32-bit VM will only be able to load 32-bit shared libraries and vice-versa for 64-bits.
+
+## Compiling on Linux
+
+Only 64-bits builds are supported at the moment. 
+
+### Compiling LLVM on Linux
+
+If you do not have native build tools you can install them first with:
+
+```shell
+sudo apt-get install cmake ninja-build build-essential
+```
+
+
+```shell
+cd deps/llvm/build
+
+cmake -G Ninja -DCLANG_BUILD_EXAMPLES=false -DCLANG_INCLUDE_DOCS=false -DCLANG_INCLUDE_TESTS=false -DCLANG_INCLUDE_DOCS=false -DCLANG_BUILD_EXAMPLES=false -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_INCLUDE_EXAMPLES=false -DLLVM_INCLUDE_DOCS=false -DLLVM_INCLUDE_TESTS=false ..
+
+ninja
+```
+
+### Compiling CppSharp on Linux
+
+We depend on a somewhat recent version of Mono (.NET 4.5). Ubuntu 14.04 contains recent enough Mono by default.
+
+```shell
+sudo apt-get install mono-devel
+```
+
+If you are using another distribution then please look into the [download page](http://www.mono-project.com/download/#download-lin) on the Mono website.
+
+Generate the makefiles, and build CppSharp:
+
+```shell
+cd <CppSharp>/build
+./premake5-linux gmake
+make -C gmake config=release_x64
+```
+
+If you need more verbosity from the builds invoke `make` as:
+
+```shell
+verbose=true make -C gmake config=release_x64
+```
+
+Additionally, you may want to run a very simple test to see that it works. The test needs to find CppSharp library, so cppsharp-test needs to be clone in to the same directory where you cloned CppSharp. Also, the CppSharp directory needs to be named "cppsharp".
+
+```shell
+git clone git://github.com/tomba/cppsharp-test.git
+cd cppsharp-test
+make runtest
+```
 
 ## Generating bindings
 
@@ -70,13 +175,13 @@ public interface ILibrary
 	void Setup(Driver driver);
 
 	/// Setup your passes here.
-	void SetupPasses(Driver driver, PassBuilder passes);
+	void SetupPasses(Driver driver);
 
 	/// Do transformations that should happen before passes are processed.
-	void Preprocess(Driver driver, Library lib);
+	void Preprocess(Driver driver, ASTContext ctx);
 
 	/// Do transformations that should happen after passes are processed.
-	void Postprocess(Driver driver, Library lib);
+	void Postprocess(Driver driver, ASTContext ctx);
 }
 ```
 
@@ -263,15 +368,15 @@ whose methods get called for each declaration that was parsed from the headers
 CppSharp already comes with a collection of useful built-in passes and we will
 now see how to use them to fix the flaws enumerated above. 
 
-2. `void SetupPasses(Driver driver, PassBuilder passes)`
+2. `void SetupPasses(Driver driver)`
 
 New passes are added to the generator by using the API provided by `PassBuilder`.
 
 ```csharp
-void SetupPasses(Driver driver, PassBuilder passes)
+void SetupPasses(Driver driver)
 {
-	passes.RenameDeclsUpperCase(RenameTargets.Any);
-	passes.FunctionToInstanceMethod();
+	driver.TranslationUnitPasses.RenameDeclsUpperCase(RenameTargets.Any);
+	driver.TranslationUnitPasses.AddPass(new FunctionToInstanceMethodPass());
 }
 ```
 
@@ -378,8 +483,8 @@ Now that the bindings are looking good from a .NET perspective, let's see how
 we can achieve more advanced things by using the remaining overloads in the
 interface.
 
-3. `void Preprocess(Driver driver, Library lib);`
-4. `void Postprocess(Driver driver, Library lib);`
+3. `void Preprocess(Driver driver, ASTContext ctx);`
+4. `void Postprocess(Driver driver, ASTContext ctx);`
 
 As their comments suggest, these get called either before or after the the
 passes we setup earlier are run and they allow you free reign to manipulate
@@ -389,11 +494,11 @@ Let's say we want to change the class to provide .NET value semantics,
 drop one field from the generated bindings and rename the `FooAdd` function.
     
 ```csharp            
-void Postprocess(Driver driver, Library lib)
+void Postprocess(Driver driver, ASTContext ctx)
 {
-  	lib.SetClassAsValueType("Foo");
-  	lib.SetNameOfFunction("FooAdd", "FooCalc");
-  	lib.IgnoreClassField("Foo", "b");
+  	ctx.SetClassAsValueType("Foo");
+  	ctx.SetNameOfFunction("FooAdd", "FooCalc");
+  	ctx.IgnoreClassField("Foo", "b");
 }            
 ```
 

@@ -1,4 +1,6 @@
-﻿using System.Linq;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 using CppSharp.AST;
 
 namespace CppSharp.Passes
@@ -9,8 +11,17 @@ namespace CppSharp.Passes
     /// stands for CppSharp. Using custom prefixes is also supported by
     /// passing the value to the constructor of the pass.
     /// 
+    ///     CS_IGNORE_FILE (translation units)
+    ///         Used to ignore whole translation units.
+    /// 
     ///     CS_IGNORE (declarations)
     ///         Used to ignore declarations from being processed.
+    /// 
+    ///     CS_IGNORE_GEN (declarations)
+    ///         Used to ignore declaration from being generated.
+    /// 
+    ///     CS_IGNORE_FILE (.h)
+    ///         Used to ignore all declarations of one header.
     /// 
     ///     CS_VALUE_TYPE (classes and structs)
     ///         Used to flag that a class or struct is a value type.
@@ -27,6 +38,13 @@ namespace CppSharp.Passes
     ///     CS_EQUALS / CS_HASHCODE (methods)
     ///         Used to flag method as representing the .NET Equals or
     ///         Hashcode methods.
+    /// 
+    ///     CS_CONSTRAINT(TYPE [, TYPE]*) (templates)
+    ///         Used to define constraint of generated generic type or generic method.
+    /// 
+    ///     CS_INTERNAL (methods)
+    ///         Used to flag a method as internal to an assembly. So, it is
+    ///         not accessible outside that assembly.
     /// 
     /// There isn't a standardized header provided by CppSharp so you will
     /// have to define these on your own.
@@ -45,15 +63,44 @@ namespace CppSharp.Passes
             if (AlreadyVisited(decl))
                 return false;
 
+            if (decl is DeclarationContext && !(decl is Class))
+                return true;
+
             var expansions = decl.PreprocessedEntities.OfType<MacroExpansion>();
 
-            if (expansions.Any(e => e.Text == Prefix + "_IGNORE" &&
-                                    e.Location != MacroLocation.ClassBody &&
-                                    e.Location != MacroLocation.FunctionBody &&
-                                    e.Location != MacroLocation.FunctionParameters))
-                decl.ExplicityIgnored = true;
-
+            CheckIgnoreMacros(decl, expansions);
             return true;
+        }
+
+        void CheckIgnoreMacros(Declaration decl, IEnumerable<MacroExpansion> expansions)
+        {
+            if (expansions.Any(e => e.Text == Prefix + "_IGNORE" &&
+                                    e.MacroLocation != MacroLocation.ClassBody &&
+                                    e.MacroLocation != MacroLocation.FunctionBody &&
+                                    e.MacroLocation != MacroLocation.FunctionParameters))
+            {
+                Log.Debug("Decl '{0}' was ignored due to ignore macro",
+                    decl.Name);
+                decl.ExplicitlyIgnore();
+            }
+
+            if (expansions.Any(e => e.Text == Prefix + "_IGNORE_GEN" &&
+                                    e.MacroLocation != MacroLocation.ClassBody &&
+                                    e.MacroLocation != MacroLocation.FunctionBody &&
+                                    e.MacroLocation != MacroLocation.FunctionParameters))
+                decl.GenerationKind = GenerationKind.Internal;
+        }
+
+        public override bool VisitTranslationUnit(TranslationUnit unit)
+        {
+            var expansions = unit.PreprocessedEntities.OfType<MacroExpansion>();
+
+            if (expansions.Any(e => e.Text == Prefix + "_IGNORE_FILE"))
+            {
+                unit.ExplicitlyIgnore();
+            }
+
+            return base.VisitTranslationUnit(unit);
         }
 
         public override bool VisitClassDecl(Class @class)
@@ -62,6 +109,15 @@ namespace CppSharp.Passes
 
             if (expansions.Any(e => e.Text == Prefix + "_VALUE_TYPE"))
                 @class.Type = ClassType.ValueType;
+
+            // If the class is a forward declaration, then we process the macro expansions
+            // of the complete class as if they were specified on the forward declaration.
+            if (@class.CompleteDeclaration != null)
+            {
+                var completeExpansions = @class.CompleteDeclaration.PreprocessedEntities
+                    .OfType<MacroExpansion>();
+                CheckIgnoreMacros(@class, completeExpansions);
+            }
 
             return base.VisitClassDecl(@class);
         }
@@ -101,7 +157,10 @@ namespace CppSharp.Passes
 
             if (expansions.Any(e => e.Text == Prefix + "_HASHCODE"
                 || e.Text == Prefix + "_EQUALS"))
-                method.ExplicityIgnored = true;
+                method.ExplicitlyIgnore();
+
+            if (expansions.Any(e => e.Text == Prefix + "_INTERNAL"))
+                method.Access = AccessSpecifier.Internal;
 
             return base.VisitMethodDecl(method);
         }
@@ -136,10 +195,55 @@ namespace CppSharp.Passes
                 var setMethod = property.SetMethod;
 
                 if (setMethod != null)
-                    property.SetMethod.ExplicityIgnored = true;
+                    property.SetMethod.ExplicitlyIgnore();
             }
 
             return base.VisitProperty(property);
+        }
+
+        public override bool VisitClassTemplateDecl(ClassTemplate template)
+        {
+            var expansions = template.PreprocessedEntities.OfType<MacroExpansion>();
+
+            var expansion = expansions.FirstOrDefault(e => e.Text.StartsWith(Prefix + "_CONSTRAINT"));
+            if (expansion != null)
+            {
+                var args = GetArguments(expansion.Text);
+                for (var i = 0; i < template.Parameters.Count && i < args.Length; ++i)
+                {
+                    var param = template.Parameters[i];
+                    param.Constraint = args[i];
+                    template.Parameters[i] = param;
+                }
+            }
+
+            return base.VisitClassTemplateDecl(template);
+        }
+
+        public override bool VisitFunctionTemplateDecl(FunctionTemplate template)
+        {
+            var expansions = template.PreprocessedEntities.OfType<MacroExpansion>();
+
+            var expansion = expansions.FirstOrDefault(e => e.Text.StartsWith(Prefix + "_CONSTRAINT"));
+            if (expansion != null)
+            {
+                var args = GetArguments(expansion.Text);
+                for (var i = 0; i < template.Parameters.Count && i < args.Length; ++i)
+                {
+                    var param = template.Parameters[i];
+                    param.Constraint = args[i];
+                    template.Parameters[i] = param;
+                }
+            }
+
+            return base.VisitFunctionTemplateDecl(template);
+        }
+
+        private static string[] GetArguments(string str)
+        {
+            str = str.Substring(str.LastIndexOf('('));
+            str = str.Trim('(', ')');
+            return str.Split(',');
         }
     }
 }

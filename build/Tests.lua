@@ -12,11 +12,11 @@ function SetupExampleProject()
   SetupParser()
 end
 
-function SetupTestProject(name, file, lib)
+function SetupTestProject(name, extraFiles)
   SetupTestGeneratorProject(name)
   SetupTestNativeProject(name)  
-  SetupTestProjectsCSharp(name, file, lib)
-  SetupTestProjectsCLI(name, file, lib)
+  SetupTestProjectsCSharp(name, nil, extraFiles)
+  SetupTestProjectsCLI(name, extraFiles)
 end
 
 function SetupTestCSharp(name)
@@ -38,7 +38,7 @@ function SetupManagedTestProject()
     SetupManagedProject()
 end
 
-function SetupTestGeneratorProject(name)
+function SetupTestGeneratorProject(name, depends)
   project(name .. ".Gen")
     SetupManagedTestProject()
     kind "ConsoleApp"
@@ -47,12 +47,18 @@ function SetupTestGeneratorProject(name)
 
     dependson { name .. ".Native" }
 
-    links
-    {
+    linktable = {
+      "System.Core",
       "CppSharp.AST",
       "CppSharp.Generator",
-      "CppSharp.Generator.Tests"
+      "CppSharp.Generator.Tests",
     }
+
+    if depends ~= nil then
+      table.insert(linktable, depends .. ".Gen")
+    end
+
+    links(linktable)
 
     SetupParser()
 end
@@ -63,11 +69,15 @@ function SetupTestGeneratorBuildEvent(name)
     prebuildcommands { exePath }
   else
     local exePath = SafePath("%{cfg.buildtarget.directory}/" .. name .. ".Gen.exe")
-    prebuildcommands { "mono " .. exePath }
+    prebuildcommands { "mono --debug " .. exePath }
   end
 end
 
-function SetupTestNativeProject(name)
+function SetupTestNativeProject(name, depends)
+  if string.starts(action, "vs") and not os.is_windows() then
+    return
+  end
+
   project(name .. ".Native")
 
     SetupNativeProject()
@@ -77,6 +87,10 @@ function SetupTestNativeProject(name)
 
     flags { common_flags }
     files { "**.h", "**.cpp" }
+
+    if depends ~= nil then
+      links { depends .. ".Native" }
+    end
 end
 
 function LinkNUnit()
@@ -88,12 +102,12 @@ function LinkNUnit()
 
   links
   {
-    "NUnit.Framework",
+    "nunit.framework",
     "NSubstitute"
   }
 end
 
-function SetupTestProjectsCSharp(name, file, lib)
+function SetupTestProjectsCSharp(name, depends, extraFiles)
   project(name .. ".CSharp")
     SetupManagedTestProject()
 
@@ -104,8 +118,19 @@ function SetupTestProjectsCSharp(name, file, lib)
     {
       path.join(gendir, name, name .. ".cs"),
     }
+    if extraFiles ~= nil then
+      for _, file in pairs(extraFiles) do
+        files { path.join(gendir, name, file .. ".cs") }
+      end
+    end
 
-    links { "CppSharp.Runtime" }
+    linktable = { "CppSharp.Runtime" }
+
+    if depends ~= nil then
+      table.insert(linktable, depends .. ".CSharp")
+    end
+
+    links(linktable)
 
   project(name .. ".Tests.CSharp")
     SetupManagedTestProject()
@@ -118,7 +143,11 @@ function SetupTestProjectsCSharp(name, file, lib)
     links { "CppSharp.Runtime" }
 end
 
-function SetupTestProjectsCLI(name, file, lib)
+function SetupTestProjectsCLI(name, extraFiles)
+  if not os.is_windows() then
+    return
+  end
+
   project(name .. ".CLI")
     SetupNativeProject()
 
@@ -132,8 +161,14 @@ function SetupTestProjectsCLI(name, file, lib)
     files
     {
       path.join(gendir, name, name .. ".cpp"),
-      path.join(gendir, name, name .. ".h"),
+      path.join(gendir, name, name .. ".h")
     }
+    if extraFiles ~= nil then
+      for _, file in pairs(extraFiles) do
+        files { path.join(gendir, name, file .. ".cpp") }
+        files { path.join(gendir, name, file .. ".h") }
+      end
+    end
 
     includedirs { path.join(testsdir, name), incdir }
     links { name .. ".Native" }    

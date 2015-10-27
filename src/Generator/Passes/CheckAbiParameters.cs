@@ -1,4 +1,5 @@
-﻿using CppSharp.AST;
+﻿using System.Linq;
+using CppSharp.AST;
 
 namespace CppSharp.Passes
 {
@@ -12,6 +13,9 @@ namespace CppSharp.Passes
     /// and use that to call the function instead. In the case of parameters
     /// then the type of that parameter is converted to a pointer.
     /// 
+    /// Furthermore, there's at least one ABI (System V) that gives to empty structs
+    /// size 1 in C++ and size 0 in C. The former causes crashes in older versions of Mono.
+    /// 
     /// Itanium ABI reference (3.1.4 Return values):
     /// http://refspecs.linux-foundation.org/cxxabi-1.83.html#calls
     ///
@@ -20,11 +24,17 @@ namespace CppSharp.Passes
     /// </summary>
     public class CheckAbiParameters : TranslationUnitPass
     {
-        private readonly DriverOptions options;
-
-        public CheckAbiParameters(DriverOptions options)
+        public override bool VisitClassDecl(Class @class)
         {
-            this.options = options;
+            if (!base.VisitClassDecl(@class))
+                return false;
+
+            if (HasFieldsOrVirtuals(@class))
+                return false;
+
+            @class.Layout.Size = @class.Layout.DataSize = 0;
+
+            return true;
         }
 
         public override bool VisitFunctionDecl(Function function)
@@ -46,9 +56,39 @@ namespace CppSharp.Passes
                     PrimitiveType.Void));
             }
 
+            var method = function as Method;
+
+            if (function.HasThisReturn)
+            {
+                // This flag should only be true on methods.
+                var classType = new QualifiedType(new TagType(method.Namespace),
+                    new TypeQualifiers {IsConst = true});
+                function.ReturnType = new QualifiedType(new PointerType(classType));
+            }
+
+            // Deleting destructors (default in v-table) accept an i32 bitfield as a
+            // second parameter.in MS ABI.
+            if (method != null && method.IsDestructor && Driver.Options.IsMicrosoftAbi)
+            {
+                method.Parameters.Add(new Parameter
+                {
+                    Kind = ParameterKind.ImplicitDestructorParameter,
+                    QualifiedType = new QualifiedType(new BuiltinType(PrimitiveType.Int)),
+                    Name = "delete"
+                });
+            }
+
             // TODO: Handle indirect parameters
 
             return true;
+        }
+
+        private static bool HasFieldsOrVirtuals(Class @class)
+        {
+            if (@class.Fields.Count > 0 || @class.IsDynamic)
+                return true;
+            return @class.Bases.Any(@base => @base.IsClass && @base.Class != @class &&
+                HasFieldsOrVirtuals(@base.Class));
         }
     }
 }

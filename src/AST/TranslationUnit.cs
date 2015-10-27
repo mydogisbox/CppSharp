@@ -12,55 +12,68 @@ namespace CppSharp.AST
     {
         public TranslationUnit()
         {
-            
+            Macros = new List<MacroDefinition>();
+            Access = AccessSpecifier.Public;
         }
 
-        public TranslationUnit(string file)
+        public TranslationUnit(string file) : this()
         {
-            Macros = new List<MacroDefinition>();
             FilePath = file;
-            Access = AccessSpecifier.Public;
         }
 
         /// Contains the macros present in the unit.
         public List<MacroDefinition> Macros;
 
-        // Whether the unit should be generated.
-        public override bool IsGenerated
-        {
-            get { return !IgnoreFlags.HasFlag(IgnoreFlags.Generation); }
-        }
-
-        // Whether the unit should be processed.
-        public override bool IsProcessed
-        {
-            get { return !IgnoreFlags.HasFlag(IgnoreFlags.Processing); }
-        }
-
-        // Whether the unit should be ignored.
-        public override bool Ignore
-        {
-            get { return IgnoreFlags != IgnoreFlags.None; }
-        }
-
         public bool IsSystemHeader { get; set; }
+
+        public bool IsValid { get { return FilePath != "<invalid>"; } }
 
         /// Contains the path to the file.
         public string FilePath;
 
+        private string fileName;
+        private string fileNameWithoutExtension;
+
         /// Contains the name of the file.
         public string FileName
         {
-            get { return Path.GetFileName(FilePath); }
+            get { return fileName ?? (fileName = Path.GetFileName(FilePath)); }
         }
 
         /// Contains the name of the module.
         public string FileNameWithoutExtension
         {
-            get { return Path.GetFileNameWithoutExtension(FileName); }
+            get
+            {
+                return fileNameWithoutExtension ??
+                    (fileNameWithoutExtension = Path.GetFileNameWithoutExtension(FileName));
+            }
         }
 
         /// Contains the include path.
         public string IncludePath;
+
+        private string fileRelativeDirectory;
+        private string fileRelativePath;
+
+        public string FileRelativeDirectory
+        {
+            get
+            {
+                if (fileRelativeDirectory != null) return fileRelativeDirectory;
+                var path = IncludePath.Replace('\\', '/');
+                var index = path.LastIndexOf('/');
+                return fileRelativeDirectory = path.Substring(0, index);
+            }
+        }
+
+        public string FileRelativePath
+        {
+            get
+            {
+                return fileRelativePath ??
+                    (fileRelativePath = Path.Combine(FileRelativeDirectory, FileName));
+            }
+        }
     }
 }

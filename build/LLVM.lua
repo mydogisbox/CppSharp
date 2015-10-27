@@ -1,11 +1,11 @@
 -- Setup the LLVM dependency directories
 
-LLVMRootDir = "../../deps/LLVM/"
-LLVMBuildDir = "../../deps/LLVM/build/"
+LLVMRootDir = "../../deps/llvm/"
+LLVMBuildDir = "../../deps/llvm/build/"
 
 -- TODO: Search for available system dependencies
 
-function SetupLLVMLibs()
+function SetupLLVMIncludes()
   local c = configuration()
 
   includedirs
@@ -16,7 +16,15 @@ function SetupLLVMLibs()
     path.join(LLVMBuildDir, "include"),
     path.join(LLVMBuildDir, "tools/clang/include"),
   }
-  
+
+  configuration(c)
+end
+
+function SetupLLVMLibs()
+  local c = configuration()
+
+  libdirs { path.join(LLVMBuildDir, "lib") }
+
   configuration { "Debug", "vs*" }
     libdirs { path.join(LLVMBuildDir, "Debug/lib") }
 
@@ -24,12 +32,53 @@ function SetupLLVMLibs()
     libdirs { path.join(LLVMBuildDir, "RelWithDebInfo/lib") }
 
   configuration "not vs*"
-    buildoptions { "-fpermissive" }
     defines { "__STDC_CONSTANT_MACROS", "__STDC_LIMIT_MACROS" }
-    libdirs { path.join(LLVMBuildDir, "lib") }
 
   configuration "macosx"
     links { "c++", "curses", "pthread", "z" }
 
+  configuration "*"
+    links
+    {
+      "clangFrontend",
+      "clangDriver",
+      "clangSerialization",
+      "clangCodeGen",
+      "clangParse",
+      "clangSema",
+      "clangAnalysis",
+      "clangEdit",
+      "clangAST",
+      "clangLex",
+      "clangBasic",
+      "clangIndex",
+      "LLVMLinker",
+      "LLVMipo",
+      "LLVMVectorize",
+      "LLVMBitWriter",
+      "LLVMIRReader",
+      "LLVMAsmParser",
+      "LLVMOption",
+      "LLVMInstrumentation",
+      "LLVMProfileData",
+      "LLVMX86AsmParser",
+      "LLVMX86Desc",
+      "LLVMObject",
+      "LLVMMCParser",
+      "LLVMBitReader",
+      "LLVMX86Info",
+      "LLVMX86AsmPrinter",
+      "LLVMX86Utils",
+      "LLVMCodeGen",
+      "LLVMScalarOpts",
+      "LLVMInstCombine",
+      "LLVMTransformUtils",
+      "LLVMAnalysis",
+      "LLVMTarget",
+      "LLVMMC",
+      "LLVMCore",
+      "LLVMSupport",
+    }
+    
   configuration(c)
 end

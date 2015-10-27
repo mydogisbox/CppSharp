@@ -8,49 +8,44 @@
 #pragma once
 
 #include "AST.h"
-
-#define VECTOR_OPTIONS(type, name) \
-    std::vector<type> name; \
-    type get##name (unsigned i) { return name[i]; } \
-    void add##name (const type& s) { return name.push_back(s); } \
-    unsigned get##name##Count () { return name.size(); }
-
-#define VECTOR_STRING_OPTIONS(name) \
-    std::vector<std::string> name; \
-    const char* get##name (unsigned i) { return name[i].c_str(); } \
-    void add##name (const char* s) { return name.push_back(std::string(s)); } \
-    unsigned get##name##Count () { return name.size(); }
-
-#define STRING_OPTIONS(name) \
-    std::string name; \
-    const char* get##name() { return name.c_str(); } \
-    void set##name(const char* s) { name = s; }
+#include "Helpers.h"
+#include "Target.h"
 
 namespace CppSharp { namespace CppParser {
 
 using namespace CppSharp::CppParser::AST;
 
+enum class LanguageVersion
+{
+    /**
+    * The C programming language.
+    */
+    C,
+    /**
+    * The C++ programming language year 1998; supports deprecated constructs.
+    */
+    CPlusPlus98,
+    /**
+    * The C++ programming language year 2011.
+    */
+    CPlusPlus11
+};
+
 struct CS_API ParserOptions
 {
-    ParserOptions()
-        : ASTContext(0)
-        , ToolSetToUse(0)
-        , Abi(CppAbi::Itanium)
-        , NoStandardIncludes(false)
-        , NoBuiltinIncludes(false)
-        , MicrosoftMode(false)
-        , Verbose(false)
-    {
-    }
+    ParserOptions();
+
+    VECTOR_STRING(Arguments)
 
     // C/C++ header file name.
-    STRING_OPTIONS(FileName)
+    STRING(FileName)
 
     // Include directories
-    VECTOR_STRING_OPTIONS(IncludeDirs)
-    VECTOR_STRING_OPTIONS(SystemIncludeDirs)
-    VECTOR_STRING_OPTIONS(Defines)
-    VECTOR_STRING_OPTIONS(LibraryDirs)
+    VECTOR_STRING(IncludeDirs)
+    VECTOR_STRING(SystemIncludeDirs)
+    VECTOR_STRING(Defines)
+    VECTOR_STRING(Undefines)
+    VECTOR_STRING(LibraryDirs)
 
     CppSharp::CppParser::AST::ASTContext* ASTContext;
 
@@ -62,9 +57,12 @@ struct CS_API ParserOptions
     bool NoBuiltinIncludes;
     bool MicrosoftMode;
     bool Verbose;
+    LanguageVersion LanguageVersion;
+
+    ParserTargetInfo* TargetInfo;
 };
 
-enum struct ParserDiagnosticLevel
+enum class ParserDiagnosticLevel
 {
     Ignored,
     Note,
@@ -75,6 +73,9 @@ enum struct ParserDiagnosticLevel
 
 struct CS_API ParserDiagnostic
 {
+    ParserDiagnostic();
+    ParserDiagnostic(const ParserDiagnostic&);
+
     STRING(FileName)
     STRING(Message)
     ParserDiagnosticLevel Level;
@@ -82,20 +83,27 @@ struct CS_API ParserDiagnostic
     int ColumnNumber;
 };
 
-enum struct ParserResultKind
+enum class ParserResultKind
 {
     Success,
     Error,
     FileNotFound
 };
 
+class Parser;
+
 struct CS_API ParserResult
 {
+    ParserResult();
+    ParserResult(const ParserResult&);
+    ~ParserResult();
+
     ParserResultKind Kind;
-    VECTOR_OPTIONS(ParserDiagnostic, Diagnostics)
+    VECTOR(ParserDiagnostic, Diagnostics)
 
     CppSharp::CppParser::AST::ASTContext* ASTContext;
     CppSharp::CppParser::AST::NativeLibrary* Library;
+    Parser* CodeParser;
 };
 
 enum class SourceLocationKind
@@ -113,6 +121,7 @@ public:
 
     static ParserResult* ParseHeader(ParserOptions* Opts);
     static ParserResult* ParseLibrary(ParserOptions* Opts);
+    static ParserTargetInfo* GetTargetInfo(ParserOptions* Opts);
 };
 
 } }

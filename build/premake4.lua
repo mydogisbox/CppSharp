@@ -6,45 +6,8 @@ config = {}
 
 dofile "Helpers.lua"
 dofile "Tests.lua"
-
--- Setup the LLVM dependency
 dofile "LLVM.lua"
-
-newoption {
-     trigger = "parser",
-     description = "Controls which version of the parser is enabled.",
-     value = "version",
-     allowed = {
-          { "cpp", "Cross-platform C++ parser."},
-          { "cli", "VS-only C++/CLI parser."},
-     }
-}
-
-function SetupCLIParser()
-  local parser = _OPTIONS["parser"]
-  if not parser or parser == "cli" then
-    defines { "OLD_PARSER" }
-    links { "CppSharp.Parser" }
-  else
-    links { "CppSharp.Parser.CLI" }
-  end
-end
-
-function SetupCSharpParser()
-  links
-  {
-    "CppSharp.Parser.CSharp",
-    "CppSharp.Runtime"
-  }
-end
-
-function SetupParser()
-  if string.match(action, "vs*") then
-    SetupCLIParser()
-  else
-    SetupCSharpParser()
-  end
-end
+dofile "Parser.lua"
 
 solution "CppSharp"
 
@@ -53,12 +16,17 @@ solution "CppSharp"
   flags { common_flags }
   
   location (builddir)
-  objdir (builddir .. "/obj/")
+  objdir (path.join(builddir, "obj"))
   targetdir (libdir)
-  libdirs { libdir }
   debugdir (bindir)
 
-  -- startproject "Generator"
+  if action == "vs2015" then
+
+  configuration "vs2015"
+    framework "4.6"
+
+  end
+
   configuration "vs2013"
     framework "4.0"
 
@@ -67,7 +35,7 @@ solution "CppSharp"
 
   configuration "windows"
     defines { "WINDOWS" }
-
+	
   configuration {}
     
   if string.starts(action, "vs") then
@@ -75,11 +43,11 @@ solution "CppSharp"
   group "Examples"
     IncludeExamples()
   
+  end
+  
   group "Tests"
       IncludeTests()
       
-  end
-  
   group "Libraries"
     include (srcdir .. "/Core")
     include (srcdir .. "/AST/AST.lua")
@@ -87,7 +55,3 @@ solution "CppSharp"
     include (srcdir .. "/Generator.Tests/Generator.Tests.lua")
     include (srcdir .. "/Runtime/Runtime.lua")
     include (srcdir .. "/CppParser")
-
-    if string.starts(action, "vs") then
-      include (srcdir .. "/Parser/Parser.lua")
-    end

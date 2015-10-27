@@ -2,10 +2,6 @@
 using System.Linq;
 using CppSharp.AST;
 
-#if !OLD_PARSER
-using CppAbi = CppSharp.Parser.AST.CppAbi;
-#endif
-
 namespace CppSharp.Passes
 {
     /// <summary>
@@ -26,7 +22,11 @@ namespace CppSharp.Passes
         public override bool VisitTranslationUnit(TranslationUnit unit)
         {
             var result = base.VisitTranslationUnit(unit);
-            unit.Classes.AddRange(internalImpls);
+            foreach (var internalImpl in internalImpls)
+                if (internalImpl.Namespace != null)
+                    internalImpl.Namespace.Classes.Add(internalImpl);
+                else
+                    unit.Classes.AddRange(internalImpls);
 
             internalImpls.Clear();
             return result;
@@ -34,11 +34,11 @@ namespace CppSharp.Passes
 
         public override bool VisitClassDecl(Class @class)
         {
+            if (!base.VisitClassDecl(@class) || @class.Ignore)
+                return false;
+
             if (@class.CompleteDeclaration != null)
                 return VisitClassDecl(@class.CompleteDeclaration as Class);
-
-            if (!VisitDeclaration(@class))
-                return false;
 
             if (@class.IsAbstract)
             {
@@ -49,40 +49,27 @@ namespace CppSharp.Passes
                 internalImpls.Add(AddInternalImplementation(@class));
             }
 
-            return base.VisitClassDecl(@class);
+            return @class.IsAbstract;
         }
 
-        private Class AddInternalImplementation(Class @class)
+        private static Class AddInternalImplementation(Class @class)
         {
             var internalImpl = GetInternalImpl(@class);
 
             var abstractMethods = GetRelevantAbstractMethods(@class);
 
-            foreach (var abstractMethod in abstractMethods)
-            {
-                var method = new Method(abstractMethod) { Namespace = internalImpl };
-                internalImpl.Methods.Add(method);
+            internalImpl.Methods.AddRange(
+                from method in abstractMethods
+                select new Method(method)
+                {
+                    Namespace = internalImpl,
+                    OriginalFunction = method,
+                    IsPure = false,
+                    IsOverride = true,
+                    SynthKind = FunctionSynthKind.AbstractImplCall
+                });
 
-                var @delegate = new TypedefDecl
-                                {
-                                    Name = ASTHelpers.GetDelegateName(abstractMethod),
-                                    QualifiedType = abstractMethod.GetFunctionType(),
-                                    IgnoreFlags = abstractMethod.IgnoreFlags,
-                                    Namespace = internalImpl,
-                                    Access = AccessSpecifier.Private
-                                };
-                internalImpl.Typedefs.Add(@delegate);
-            }
-
-            internalImpl.Layout = new ClassLayout(@class.Layout);
-            FillVTable(@class, abstractMethods, internalImpl);
-
-            foreach (var method in internalImpl.Methods)
-            {
-                method.IsPure = false;
-                method.IsOverride = true;
-                method.IsSynthetized = true;
-            }
+            internalImpl.Layout = @class.Layout;
 
             return internalImpl;
         }
@@ -92,7 +79,7 @@ namespace CppSharp.Passes
             var internalImpl = new Class
                                 {
                                     Name = @class.Name + "Internal",
-                                    Access = @class.Access,
+                                    Access = AccessSpecifier.Private,
                                     Namespace = @class.Namespace
                                 };
 
@@ -102,7 +89,7 @@ namespace CppSharp.Passes
             return internalImpl;
         }
 
-        private static List<Method> GetRelevantAbstractMethods(Class @class)
+        private static IEnumerable<Method> GetRelevantAbstractMethods(Class @class)
         {
             var abstractMethods = GetAbstractMethods(@class);
             var overriddenMethods = GetOverriddenMethods(@class);
@@ -111,12 +98,29 @@ namespace CppSharp.Passes
             for (var i = abstractMethods.Count - 1; i >= 0; i--)
             {
                 var @abstract = abstractMethods[i];
-                if (overriddenMethods.Find(m => m.Name == @abstract.Name &&
-                    m.ReturnType == @abstract.ReturnType &&
-                    m.Parameters.Count == @abstract.Parameters.Count &&
-                    m.Parameters.SequenceEqual(@abstract.Parameters, paramTypeCmp)) != null)
+                var @override = overriddenMethods.Find(m => m.Name == @abstract.Name && 
+                    m.ReturnType == @abstract.ReturnType && 
+                    m.Parameters.SequenceEqual(@abstract.Parameters, paramTypeCmp));
+                if (@override != null)
                 {
-                    abstractMethods.RemoveAt(i);
+                    if (@abstract.IsOverride)
+                    {
+                        var abstractMethod = abstractMethods[i];
+                        bool found;
+                        var rootBaseMethod = abstractMethod;
+                        do
+                        {
+                            rootBaseMethod = @class.GetBaseMethod(rootBaseMethod, false, true);
+                            if (found = (rootBaseMethod == @override))
+                                break;
+                        } while (rootBaseMethod != null);
+                        if (!found)
+                            abstractMethods.RemoveAt(i);
+                    }
+                    else
+                    {
+                        abstractMethods.RemoveAt(i);                        
+                    }
                 }
             }
 
@@ -134,86 +138,11 @@ namespace CppSharp.Passes
 
         private static List<Method> GetOverriddenMethods(Class @class)
         {
-            var abstractMethods = @class.Methods.Where(m => m.IsOverride).ToList();
+            var overriddenMethods = @class.Methods.Where(m => m.IsOverride && !m.IsPure).ToList();
             foreach (var @base in @class.Bases)
-                abstractMethods.AddRange(GetOverriddenMethods(@base.Class));
+                overriddenMethods.AddRange(GetOverriddenMethods(@base.Class));
 
-            return abstractMethods;
-        }
-
-        private void FillVTable(Class @class, IList<Method> abstractMethods, Class internalImplementation)
-        {
-            switch (Driver.Options.Abi)
-            {
-                case CppAbi.Microsoft:
-                    CreateVTableMS(@class, abstractMethods, internalImplementation);
-                    break;
-                default:
-                    CreateVTableItanium(@class, abstractMethods, internalImplementation);
-                    break;
-            }
-        }
-
-        private static void CreateVTableMS(Class @class,
-            IList<Method> abstractMethods, Class internalImplementation)
-        {
-            var vtables = GetVTables(@class);
-            for (int i = 0; i < abstractMethods.Count; i++)
-            {
-                for (int j = 0; j < vtables.Count; j++)
-                {
-                    var vTable = vtables[j];
-                    var k = vTable.Layout.Components.FindIndex(v => v.Method == abstractMethods[i]);
-                    if (k >= 0)
-                    {
-                        var vTableComponent = vTable.Layout.Components[k];
-                        vTableComponent.Declaration = internalImplementation.Methods[i];
-                        vTable.Layout.Components[k] = vTableComponent;
-                        vtables[j] = vTable;
-                    }
-                }
-            }
-
-            internalImplementation.Layout.VFTables.Clear();
-            internalImplementation.Layout.VFTables.AddRange(vtables);
-        }
-
-        private static void CreateVTableItanium(Class @class,
-            IList<Method> abstractMethods, Class internalImplementation)
-        {
-            var vtableComponents = GetVTableComponents(@class);
-            for (var i = 0; i < abstractMethods.Count; i++)
-            {
-                var j = vtableComponents.FindIndex(v => v.Method == abstractMethods[i]);
-                var vtableComponent = vtableComponents[j];
-                vtableComponent.Declaration = internalImplementation.Methods[i];
-                vtableComponents[j] = vtableComponents[j];
-            }
-
-            internalImplementation.Layout.Layout.Components.Clear();
-            internalImplementation.Layout.Layout.Components.AddRange(vtableComponents);
-        }
-
-        private static List<VTableComponent> GetVTableComponents(Class @class)
-        {
-            var vtableComponents = new List<VTableComponent>(
-                @class.Layout.Layout.Components);
-
-            foreach (var @base in @class.Bases)
-                vtableComponents.AddRange(GetVTableComponents(@base.Class));
-
-            return vtableComponents;
-        }
-
-        private static List<VFTableInfo> GetVTables(Class @class)
-        {
-            var vtables = new List<VFTableInfo>(
-                @class.Layout.VFTables);
-
-            foreach (var @base in @class.Bases)
-                vtables.AddRange(GetVTables(@base.Class));
-
-            return vtables;
+            return overriddenMethods;
         }
     }
 }

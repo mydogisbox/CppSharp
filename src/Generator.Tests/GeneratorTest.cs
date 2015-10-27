@@ -33,24 +33,41 @@ namespace CppSharp.Utils
             options.Quiet = true;
             options.IgnoreParseWarnings = true;
 
-            driver.Diagnostics.EmitMessage("");
-            driver.Diagnostics.EmitMessage("Generating bindings for {0} ({1})",
+            driver.Diagnostics.Message("");
+            driver.Diagnostics.Message("Generating bindings for {0} ({1})",
                 options.LibraryName, options.GeneratorKind.ToString());
 
             // Workaround for CLR which does not check for .dll if the
             // name already has a dot.
-            if (System.Type.GetType("Mono.Runtime") == null)
+            if (!Platform.IsMono)
                 options.SharedLibraryName += ".dll";
 
-            var path = Path.GetFullPath(GetTestsDirectory(name));
+            if (Platform.IsMacOS)
+                options.TargetTriple = Environment.Is64BitProcess ? "x86_64-apple-darwin" : "i686-apple-darwin";
 
-#if OLD_PARSER
-            options.IncludeDirs.Add(path);
-#else
+            var path = Path.GetFullPath(GetTestsDirectory(name));
             options.addIncludeDirs(path);
+
+#if BROKEN
+            var foundClangResourceDir = false;
+            for (uint i = 0; i < options.SystemIncludeDirsCount; ++i)
+            {
+                var dir = options.getSystemIncludeDirs(i);
+                if (dir.Contains(Path.Combine("lib", "clang")))
+                {
+                    foundClangResourceDir = true;
+                    break;
+                }
+            }
+
+            if (!foundClangResourceDir)
+            {
+                var dir = Path.GetFullPath(Path.Combine(path, "../../deps/llvm/tools/clang/lib/Headers"));
+                options.addSystemIncludeDirs(dir);
+            }
 #endif
 
-            driver.Diagnostics.EmitMessage("Looking for tests in: {0}", path);
+            driver.Diagnostics.Message("Looking for tests in: {0}", path);
             var files = Directory.EnumerateFiles(path, "*.h");
             foreach (var file in files)
                 options.Headers.Add(Path.GetFileName(file));
@@ -60,7 +77,7 @@ namespace CppSharp.Utils
         {
         }
 
-        public virtual void Postprocess(Driver driver, ASTContext lib)
+        public virtual void Postprocess(Driver driver, ASTContext ctx)
         {
         }
 

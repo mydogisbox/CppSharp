@@ -29,6 +29,7 @@ namespace CppSharp.AST
         public bool VisitNamespaceEvents = true;
         public bool VisitNamespaceVariables = true;
 
+        public bool VisitFunctionReturnType = true;
         public bool VisitFunctionParameters = true;
         public bool VisitTemplateArguments = true;
     }
@@ -84,7 +85,7 @@ namespace CppSharp.AST
             if (array.SizeType == ArrayType.ArraySize.Dependent)
                 return false;
 
-            return array.Type.Visit(this, quals);
+            return array.QualifiedType.Visit(this);
         }
 
         public virtual bool VisitFunctionType(FunctionType function, TypeQualifiers quals)
@@ -119,7 +120,7 @@ namespace CppSharp.AST
             if (!VisitType(member, quals))
                 return false;
 
-            return member.Pointee.Visit(this, quals);
+            return member.QualifiedPointee.Visit(this);
         }
 
         public virtual bool VisitBuiltinType(BuiltinType builtin, TypeQualifiers quals)
@@ -217,6 +218,11 @@ namespace CppSharp.AST
             return true;
         }
 
+        public bool VisitPackExpansionType(PackExpansionType packExpansionType, TypeQualifiers quals)
+        {
+            return true;
+        }
+
         public virtual bool VisitPrimitiveType(PrimitiveType type, TypeQualifiers quals)
         {
             return true;
@@ -285,7 +291,18 @@ namespace CppSharp.AST
             if (!VisitDeclaration(property))
                 return false;
 
-            return property.Type.Visit(this);
+            if (Options.VisitFunctionReturnType)
+                return property.Type.Visit(this);
+
+            return true;
+        }
+
+        public bool VisitFriend(Friend friend)
+        {
+            if (!VisitDeclaration(friend))
+                return false;
+
+            return friend.Declaration.Visit(this);
         }
 
         public virtual bool VisitFunctionDecl(Function function)
@@ -294,7 +311,7 @@ namespace CppSharp.AST
                 return false;
 
             var retType = function.ReturnType;
-            if (retType.Type != null)
+            if (Options.VisitFunctionReturnType && retType.Type != null)
                 retType.Type.Visit(this, retType.Qualifiers);
 
             if (Options.VisitFunctionParameters)
@@ -302,7 +319,7 @@ namespace CppSharp.AST
                     param.Visit(this);
 
             return true;
-        }    
+        }
 
         public virtual bool VisitMethodDecl(Method method)
         {
@@ -341,6 +358,9 @@ namespace CppSharp.AST
 
         public virtual bool VisitVariableDecl(Variable variable)
         {
+            if (!VisitDeclaration(variable))
+                return false;
+
             return variable.Type.Visit(this, variable.QualifiedType.Qualifiers);
         }
 

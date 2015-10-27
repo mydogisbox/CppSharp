@@ -6,6 +6,8 @@ namespace CppSharp.AST
 {
     public static class VTables
     {
+        public const int ItaniumOffsetToTopAndRTTI = 2;
+
         public static List<VTableComponent> GatherVTableMethodEntries(Class @class)
         {
             switch (@class.Layout.ABI)
@@ -16,10 +18,12 @@ namespace CppSharp.AST
                 return GatherVTableMethodsItanium(@class);
             }
 
-            throw new NotSupportedException();
+            throw new NotSupportedException(
+                string.Format("VTable format for {0} is not supported", @class.Layout.ABI.ToString().Split('.').Last())
+            );
         }
 
-        public static List<VTableComponent> GatherVTableMethodEntries(VTableLayout layout)
+        private static List<VTableComponent> GatherVTableMethodEntries(VTableLayout layout)
         {
             var entries = new List<VTableComponent>();
             if (layout == null)
@@ -50,42 +54,27 @@ namespace CppSharp.AST
             return GatherVTableMethodEntries(@class.Layout.Layout);
         }
 
-        public static int GetVTableComponentIndex(VTableLayout layout, VTableComponent entry)
-        {
-            return layout.Components.IndexOf(entry);
-        }
 
-        public static int GetVTableComponentIndex(Class @class, VTableComponent entry)
-        {
-            switch (@class.Layout.ABI)
-            {
-            case CppAbi.Microsoft:
-                foreach (var vfptr in @class.Layout.VFTables)
-                {
-                    var index = GetVTableComponentIndex(vfptr.Layout, entry);
-                    if (index >= 0)
-                        return index;
-                }
-                break;
-            case CppAbi.Itanium:
-                return GetVTableComponentIndex(@class.Layout.Layout, entry);
-            }
-
-            throw new NotSupportedException();
-        }
-
-        public static int GetVTableIndex(INamedDecl method, Class @class)
+        public static int GetVTableIndex(Function function, Class @class)
         {
             switch (@class.Layout.ABI)
             {
                 case CppAbi.Microsoft:
                     return (from table in @class.Layout.VFTables
-                            let j = table.Layout.Components.FindIndex(m => m.Method == method)
+                            let j = table.Layout.Components.FindIndex(m => m.Method == function)
                             where j >= 0
                             select j).First();
                 default:
-                    return @class.Layout.Layout.Components.FindIndex(m => m.Method == method);
+                    return @class.Layout.Layout.Components.FindIndex(m => m.Method == function) - ItaniumOffsetToTopAndRTTI;
             }
+        }
+
+        public static bool IsIgnored(this VTableComponent entry)
+        {
+            return entry.Method != null &&
+                   (entry.Method.IsOperator ||
+                    (!entry.Method.IsDeclared &&
+                     ((Class) entry.Method.Namespace).GetPropertyByConstituentMethod(entry.Method) == null));
         }
     }
 }

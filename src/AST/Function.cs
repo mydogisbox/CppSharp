@@ -25,7 +25,8 @@ namespace CppSharp.AST
     {
         Regular,
         IndirectReturnType,
-        OperatorParameter
+        OperatorParameter,
+        ImplicitDestructorParameter
     }
 
     public class Parameter : Declaration, ITypedDecl
@@ -37,13 +38,28 @@ namespace CppSharp.AST
             HasDefaultValue = false;
         }
 
+        public Parameter(Parameter p)
+            : base(p)
+        {
+            HasDefaultValue = p.HasDefaultValue;
+            Index = p.Index;
+            IsIndirect = p.IsIndirect;
+            Kind = p.Kind;
+            QualifiedType = p.QualifiedType;
+            Usage = p.Usage;
+            DefaultArgument = p.DefaultArgument;
+        }
+
         public Type Type { get { return QualifiedType.Type; } }
         public QualifiedType QualifiedType { get; set; }
         public bool IsIndirect { get; set; }
+        public uint Index { get; set; }
 
         public ParameterKind Kind { get; set; }
         public ParameterUsage Usage { get; set; }
         public bool HasDefaultValue { get; set; }
+
+        public Expression DefaultArgument { get; set; }
 
         public bool IsIn { get { return Usage == ParameterUsage.In; } }
         public bool IsOut { get { return Usage == ParameterUsage.Out; } }
@@ -76,7 +92,11 @@ namespace CppSharp.AST
     public enum FunctionSynthKind
     {
         None,
-        NonMemberOperator
+        ComplementOperator,
+        AbstractImplCall,
+        DefaultValueOverload,
+        InterfaceInstance,
+        AdjustedMethod
     }
 
     public class Function : Declaration, ITypedDecl, IMangledDecl
@@ -88,6 +108,7 @@ namespace CppSharp.AST
             IsVariadic = false;
             IsInline = false;
             Signature = string.Empty;
+            Index = null;
         }
 
         public Function(Function function)
@@ -96,7 +117,8 @@ namespace CppSharp.AST
             Parameters = new List<Parameter>();
             ReturnType = function.ReturnType;
             IsReturnIndirect = function.IsReturnIndirect;
-            Parameters.AddRange(function.Parameters);
+            HasThisReturn = function.HasThisReturn;
+            Parameters.AddRange(function.Parameters.Select(p => new Parameter(p)));
             IsVariadic = function.IsVariadic;
             IsInline = function.IsInline;
             IsPure = function.IsPure;
@@ -105,10 +127,18 @@ namespace CppSharp.AST
             SynthKind = function.SynthKind;
             OriginalFunction = function.OriginalFunction;
             Mangled = function.Mangled;
+            Index = function.Index;
+            Signature = function.Signature;
+            if (function.SpecializationInfo != null)
+            {
+                SpecializationInfo = new FunctionTemplateSpecialization(function.SpecializationInfo);
+                SpecializationInfo.SpecializedFunction = function;
+            }
         }
 
         public QualifiedType ReturnType { get; set; }
         public bool IsReturnIndirect { get; set; }
+        public bool HasThisReturn { get; set; }
 
         public List<Parameter> Parameters { get; set; }
         public bool IsVariadic { get; set; }
@@ -121,6 +151,8 @@ namespace CppSharp.AST
         public bool IsOperator { get { return OperatorKind != CXXOperatorKind.None; } }
 
         public CallingConvention CallingConvention { get; set; }
+
+        public FunctionTemplateSpecialization SpecializationInfo { get; set; }
 
         public bool IsThisCall
         {
@@ -163,15 +195,29 @@ namespace CppSharp.AST
 
                 return hiddenParam.QualifiedType;
             }
+            set
+            {
+                if (HasIndirectReturnTypeParameter)
+                    Parameters.Single(p => p.Kind == ParameterKind.IndirectReturnType).QualifiedType = value;
+                else
+                    ReturnType = value;
+            }
         }
 
         public FunctionSynthKind SynthKind { get; set; }
+        public bool IsSynthetized { get { return SynthKind != FunctionSynthKind.None; } }
+        public bool IsNonMemberOperator { get; set; }
 
         public Function OriginalFunction { get; set; }
 
         public string Mangled { get; set; }
 
         public string Signature { get; set; }
+
+        /// <summary>
+        /// Keeps an index that de-duplicates native names in the C# backend.
+        /// </summary>
+        public uint? Index { get; set; }
 
         public override T Visit<T>(IDeclVisitor<T> visitor)
         {
@@ -181,7 +227,7 @@ namespace CppSharp.AST
         public Type Type { get { return ReturnType.Type; } }
         public QualifiedType QualifiedType { get { return ReturnType; } }
 
-        public virtual QualifiedType GetFunctionType()
+        public FunctionType GetFunctionType()
         {
             var functionType = new FunctionType
                                 {
@@ -192,12 +238,7 @@ namespace CppSharp.AST
             functionType.Parameters.AddRange(Parameters);
             ReplaceIndirectReturnParamWithRegular(functionType);
 
-            var pointerType = new PointerType
-                {
-                    QualifiedPointee = new QualifiedType(functionType)
-                };
-
-            return new QualifiedType(pointerType);
+            return functionType;
         }
 
         static void ReplaceIndirectReturnParamWithRegular(FunctionType functionType)

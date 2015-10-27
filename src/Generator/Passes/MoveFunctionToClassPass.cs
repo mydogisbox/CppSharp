@@ -13,15 +13,18 @@ namespace CppSharp.Passes
             if (!VisitDeclaration(function))
                 return false;
 
-            if (function.Ignore || function.Namespace is Class)
+            if (!function.IsGenerated || function.Namespace is Class)
                 return false;
 
             var @class = FindClassToMoveFunctionTo(function.Namespace);
             if (@class != null)
+            {
                 MoveFunction(function, @class);
+                Log.Debug("Function moved to class: {0}::{1}", @class.Name, function.Name);
+            }
 
             if (function.IsOperator)
-                function.ExplicityIgnored = true;
+                function.ExplicitlyIgnore();
 
             return true;
         }
@@ -46,7 +49,7 @@ namespace CppSharp.Passes
                 IsStatic = true
             };
 
-            function.ExplicityIgnored = true;
+            function.ExplicitlyIgnore();
 
             if (method.OperatorKind != CXXOperatorKind.None)
             {
@@ -55,7 +58,7 @@ namespace CppSharp.Passes
                 if (!FunctionToInstanceMethodPass.GetClassParameter(param, out type))
                     return;
                 method.Kind = CXXMethodKind.Operator;
-                method.SynthKind = FunctionSynthKind.NonMemberOperator;
+                method.IsNonMemberOperator = true;
                 method.OriginalFunction = null;
             }
 

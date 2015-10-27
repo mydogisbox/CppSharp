@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using CppSharp.AST;
+using CppSharp.AST.Extensions;
 using Type = CppSharp.AST.Type;
 
 namespace CppSharp.Generators.AST
@@ -146,7 +147,13 @@ namespace CppSharp.Generators.AST
             var field = (Field)ancestors.Pop();
                 
             Class decl;
-            return field.Type.Desugar().IsTagDecl(out decl) && decl.IsValueType;
+            return field.Type.Desugar().TryGetClass(out decl) && decl.IsValueType;
+        }
+
+        public static bool IsDelegate(this ASTRecord record)
+        {
+            var typedef = record.Object as TypedefDecl;
+            return typedef != null && typedef.Type.GetPointee() is FunctionType;
         }
     }
 
@@ -181,9 +188,7 @@ namespace CppSharp.Generators.AST
 
         public override bool VisitType(Type type, TypeQualifiers quals)
         {
-            type = type.Desugar();
-
-            if(recordStack.Contains(type))
+            if (recordStack.Contains(type))
                 return true;
 
             recordStack.Push(type);

@@ -10,14 +10,30 @@ examplesdir = path.getabsolute("../examples");
 testsdir = path.getabsolute("../tests");
 
 builddir = path.getabsolute("./" .. action);
+if _ARGS[1] then
+    builddir = path.getabsolute("./" .. _ARGS[1]);
+end
+
 libdir = path.join(builddir, "lib", "%{cfg.buildcfg}_%{cfg.platform}");
 gendir = path.join(builddir, "gen");
 
 common_flags = { "Unicode", "Symbols" }
 msvc_buildflags = { "/wd4267" }
-gcc_buildflags = { "-std=c++11" }
+gcc_buildflags = { "-std=c++11 -fpermissive" }
 
 msvc_cpp_defines = { }
+
+function os.is_osx()
+  return os.is("macosx")
+end
+
+function os.is_windows()
+  return os.is("windows")
+end
+
+function os.is_linux()
+  return os.is("linux")
+end
 
 function string.starts(str, start)
    return string.sub(str, 1, string.len(start)) == start
@@ -47,7 +63,8 @@ function SetupNativeProject()
     buildoptions { gcc_buildflags }
     
   configuration { "macosx" }
-    buildoptions { gcc_buildflags, "-stdlib=libc++", "-fvisibility-inlines-hidden" }
+    buildoptions { gcc_buildflags, "-stdlib=libc++" }
+    links { "c++" }
   
   -- OS-specific options
   
@@ -58,12 +75,14 @@ function SetupNativeProject()
 end
 
 function SetupManagedProject()
+  language "C#"
   location (path.join(builddir, "projects"))
 
-  local c = configuration "vs*"
-    location "."
-
-  configuration(c)
+  if not os.is_osx() then
+    local c = configuration { "vs*" }
+      location "."
+    configuration(c)
+  end
 end
 
 function IncludeDir(dir)
@@ -78,4 +97,29 @@ function IncludeDir(dir)
       include(dep)
     end
   end
+end
+
+function StaticLinksOpt(libnames)
+  local cc = configuration()
+  local path = table.concat(cc.configset.libdirs, ";")
+
+  local formats
+  if os.is("windows") then
+    formats = { "%s.lib" }
+  else
+    formats = { "lib%s.a" }
+  end
+  table.insert(formats, "%s");
+
+  local existing_libnames = {}
+  for _, libname in ipairs(libnames) do
+    for _, fmt in ipairs(formats) do
+      local name = string.format(fmt, libname)
+      if os.pathsearch(name, path) then
+        table.insert(existing_libnames, libname)
+      end
+    end
+  end
+
+  links(existing_libnames)
 end

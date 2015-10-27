@@ -43,6 +43,11 @@ namespace CppSharp.Generators.CLI
         public const int Typedef = BlockKind.LAST + 14;
         public const int Variable = BlockKind.LAST + 15;
         public const int Template = BlockKind.LAST + 16;
+        public static int Destructor = BlockKind.LAST + 17;
+        public static int Finalizer = BlockKind.LAST + 18;
+        public static int AccessSpecifier = BlockKind.LAST + 19;
+        public static int Fields = BlockKind.LAST + 20;
+        public static int Field = BlockKind.LAST + 21;
     }
 
     /// <summary>
@@ -56,8 +61,8 @@ namespace CppSharp.Generators.CLI
 
         public ISet<Include> Includes;
 
-        protected CLITextTemplate(Driver driver, TranslationUnit unit)
-            : base(driver, unit)
+        protected CLITextTemplate(Driver driver, IEnumerable<TranslationUnit> units)
+            : base(driver, units)
         {
             TypePrinter = new CLITypePrinter(driver);
             Includes = new HashSet<Include>();
@@ -77,22 +82,29 @@ namespace CppSharp.Generators.CLI
         public string QualifiedIdentifier(Declaration decl)
         {
             if (Options.GenerateLibraryNamespace)
+            {
+                if (string.IsNullOrEmpty(decl.QualifiedName))
+                    return string.Format("{0}", Options.OutputNamespace);
+
                 return string.Format("{0}::{1}", Options.OutputNamespace, decl.QualifiedName);
-            return string.Format("{0}", decl.QualifiedName);
+            }
+                
+            return decl.QualifiedName;
         }
 
         public string GetMethodName(Method method)
         {
-            if (method.OperatorKind == CXXOperatorKind.Conversion)
-                return SafeIdentifier("operator " + method.ConversionType);
+            if (method.OperatorKind == CXXOperatorKind.Conversion ||
+                method.OperatorKind == CXXOperatorKind.ExplicitConversion)
+                return "operator " + method.ConversionType;
 
             if (method.IsConstructor || method.IsDestructor)
             {
                 var @class = (Class) method.Namespace;
-                return SafeIdentifier(@class.Name);
+                return @class.Name;
             }
 
-            return SafeIdentifier(method.Name);
+            return method.Name;
         }
 
         public void GenerateDeclarationCommon(Declaration decl)

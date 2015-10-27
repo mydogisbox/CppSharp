@@ -5,6 +5,8 @@ clang_msvc_flags =
   "/wd4251"
 }
 
+if not (string.starts(action, "vs") and not os.is_windows()) then
+
 project "CppSharp.CppParser"
   
   kind "SharedLib"
@@ -13,9 +15,18 @@ project "CppSharp.CppParser"
   flags { common_flags }
   flags { "NoRTTI" }
 
+  local copy = os.is_windows() and "xcopy /Q /E /Y /I" or "cp -rf";
+  local headers = path.getabsolute(path.join(LLVMRootDir, "lib/"))
+  if os.isdir(path.join(headers, "clang")) then
+    postbuildcommands { copy .. " " .. headers .. " %{cfg.targetdir}" }
+  end
+
   configuration "vs*"
     buildoptions { clang_msvc_flags }
-    files { "VSLookup.cpp" }    
+
+  if os.getenv("APPVEYOR") then
+    linkoptions { "/ignore:4099" } -- LNK4099: linking object as if no debug info
+  end    
 
   configuration "*"
   
@@ -26,50 +37,12 @@ project "CppSharp.CppParser"
     "*.lua"
   }
   
+  SetupLLVMIncludes()
   SetupLLVMLibs()
   
   configuration "*"
-  
-  links
-  {
-    "clangAnalysis",
-    "clangAST",
-    "clangBasic",
-    "clangCodeGen",
-    "clangDriver",
-    "clangEdit",
-    "clangFrontend",
-    "clangLex",
-    "clangParse",
-    "clangSema",
-    "clangSerialization",
-    "LLVMAnalysis",
-    "LLVMAsmParser",
-    "LLVMBitReader",
-    "LLVMBitWriter",
-    "LLVMCodeGen",
-    "LLVMCore",
-    "LLVMipa",
-    "LLVMipo",
-    "LLVMInstCombine",
-    "LLVMInstrumentation",
-    "LLVMIRReader",
-    "LLVMLinker",
-    "LLVMMC",
-    "LLVMMCParser",
-    "LLVMObjCARCOpts",
-    "LLVMObject",
-    "LLVMOption",
-    "LLVMScalarOpts",
-    "LLVMSupport",
-    "LLVMTarget",
-    "LLVMTransformUtils",
-    "LLVMVectorize",
-    "LLVMX86AsmParser",
-    "LLVMX86AsmPrinter",
-    "LLVMX86Desc",
-    "LLVMX86Info",
-    "LLVMX86Utils",
-  }
+
+end
 
 include ("Bindings")
+include ("Bootstrap")

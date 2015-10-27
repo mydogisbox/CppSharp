@@ -10,7 +10,8 @@ namespace CppSharp.Generators
     {
         Never,
         Always,
-        BeforeNextBlock
+        BeforeNextBlock,
+        IfNotEmpty
     }
 
     public class BlockKind
@@ -30,12 +31,14 @@ namespace CppSharp.Generators
         public NewLineKind NewLineKind { get; set; }
 
         public Block Parent { get; set; }
-        private List<Block> Blocks { get; set; }
+        public List<Block> Blocks { get; set; }
 
         public Declaration Declaration { get; set; }
 
         private bool hasIndentChanged;
         private bool isSubBlock;
+
+        public Func<bool> CheckGenerate;
 
         public Block() : this(BlockKind.Unknown)
         {
@@ -80,6 +83,9 @@ namespace CppSharp.Generators
 
         public virtual string Generate(DriverOptions options)
         {
+            if (CheckGenerate != null && !CheckGenerate())
+                return "";
+
             if (Blocks.Count == 0)
                 return Text.ToString();
 
@@ -87,9 +93,26 @@ namespace CppSharp.Generators
             uint totalIndent = 0;
             Block previousBlock = null;
 
+            var blockIndex = 0;
             foreach (var childBlock in Blocks)
             {
                 var childText = childBlock.Generate(options);
+
+                var nextBlock = (++blockIndex < Blocks.Count)
+                    ? Blocks[blockIndex]
+                    : null;
+
+                var skipBlock = false;
+                if (nextBlock != null)
+                {
+                    var nextText = nextBlock.Generate(options);
+                    if (string.IsNullOrEmpty(nextText) &&
+                        childBlock.NewLineKind == NewLineKind.IfNotEmpty)
+                        skipBlock = true;
+                }
+
+                if (skipBlock)
+                    continue;
 
                 if (string.IsNullOrEmpty(childText))
                     continue;
@@ -103,22 +126,6 @@ namespace CppSharp.Generators
                 if (childBlock.isSubBlock)
                     totalIndent = 0;
 
-                if (childBlock.Kind == BlockKind.BlockComment)
-                {
-                    // Wrap the comment to the max line width.
-                    var maxSize = options.MaxIndent - totalIndent;
-                    maxSize -= options.CommentPrefix.Length + 2;
-
-                    lines = StringHelpers.WordWrapLines(childText, (int)maxSize);
-
-                    for (var i = 0; i < lines.Count; ++i)
-                    {
-                        var line = lines[i];
-                        if (!line.StartsWith(options.CommentPrefix))
-                            lines[i] = options.CommentPrefix + " " + line;
-                    }
-                }
-
                 foreach (var line in lines)
                 {
                     if (string.IsNullOrEmpty(line))
@@ -127,6 +134,13 @@ namespace CppSharp.Generators
                     if (!string.IsNullOrWhiteSpace(line))
                         builder.Append(new string(' ', (int)totalIndent));
 
+
+                    if (childBlock.Kind == BlockKind.BlockComment &&
+                        !line.StartsWith(options.CommentPrefix))
+                    {
+                        builder.Append(options.CommentPrefix);
+                        builder.Append(' ');
+                    }
                     builder.Append(line);
 
                     if (!line.EndsWith(Environment.NewLine))
@@ -145,6 +159,17 @@ namespace CppSharp.Generators
                 builder.Append(Text.StringBuilder);
 
             return builder.ToString();
+        }
+
+        public bool IsEmpty
+        {
+            get
+            {
+                if (Blocks.Any(block => !block.IsEmpty))
+                    return false;
+
+                return string.IsNullOrEmpty(Text.ToString());
+            }
         }
 
         #region ITextGenerator implementation
@@ -215,7 +240,10 @@ namespace CppSharp.Generators
     {
         public Driver Driver { get; private set; }
         public DriverOptions Options { get; private set; }
-        public TranslationUnit TranslationUnit { get; private set; }
+        public List<TranslationUnit> TranslationUnits { get; private set; }
+
+        public TranslationUnit TranslationUnit { get { return TranslationUnits[0]; } }
+
         public IDiagnosticConsumer Log
         {
             get { return Driver.Diagnostics; }
@@ -226,11 +254,11 @@ namespace CppSharp.Generators
 
         public abstract string FileExtension { get; }
 
-        protected Template(Driver driver, TranslationUnit unit)
+        protected Template(Driver driver, IEnumerable<TranslationUnit> units)
         {
             Driver = driver;
             Options = driver.Options;
-            TranslationUnit = unit;
+            TranslationUnits = new List<TranslationUnit>(units);
             RootBlock = new Block();
             ActiveBlock = RootBlock;
         }
@@ -262,10 +290,14 @@ namespace CppSharp.Generators
             ActiveBlock = block;
         }
 
-        public void PopBlock(NewLineKind newLineKind = NewLineKind.Never)
+        public Block PopBlock(NewLineKind newLineKind = NewLineKind.Never)
         {
+            var block = ActiveBlock;
+
             ActiveBlock.NewLineKind = newLineKind;
             ActiveBlock = ActiveBlock.Parent;
+
+            return block;
         }
 
         public IEnumerable<Block> FindBlocks(int kind)
@@ -275,7 +307,7 @@ namespace CppSharp.Generators
 
         public Block FindBlock(int kind)
         {
-            return FindBlocks(kind).Single();
+            return FindBlocks(kind).SingleOrDefault();
         }
 
         #endregion

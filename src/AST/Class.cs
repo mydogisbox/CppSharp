@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using CppSharp.AST.Extensions;
 
 namespace CppSharp.AST
 {
@@ -9,7 +10,8 @@ namespace CppSharp.AST
     {
         Private,
         Protected,
-        Public
+        Public,
+        Internal
     }
 
     // A C++ access specifier declaration.
@@ -24,18 +26,29 @@ namespace CppSharp.AST
     // Represents a base class of a C++ class.
     public class BaseClassSpecifier
     {
+        public BaseClassSpecifier()
+        {
+        }
+
+        public BaseClassSpecifier(BaseClassSpecifier other)
+        {
+            Access = other.Access;
+            IsVirtual = other.IsVirtual;
+            Type = other.Type;
+            Offset = other.Offset;
+        }
+
         public AccessSpecifier Access { get; set; }
         public bool IsVirtual { get; set; }
         public Type Type { get; set; }
+        public int Offset { get; set; }
 
         public Class Class
         {
             get
             {
                 Class @class;
-                if (!Type.IsTagDecl(out @class))
-                    throw new NotSupportedException();
-
+                Type.TryGetClass(out @class);
                 return @class;
             }
         }
@@ -44,8 +57,7 @@ namespace CppSharp.AST
         {
             get
             {
-                Class @class;
-                return Type.IsTagDecl(out @class);
+                return Type.IsClass();
             }
         }
     }
@@ -99,6 +111,9 @@ namespace CppSharp.AST
         // True if the class has a non trivial destructor.
         public bool HasNonTrivialDestructor;
 
+        // True if the class represents a static class.
+        public bool IsStatic;
+
         public Class()
         {
             Bases = new List<BaseClassSpecifier>();
@@ -112,6 +127,28 @@ namespace CppSharp.AST
             IsPOD = false;
             Type = ClassType.RefType;
             Layout = new ClassLayout();
+        }
+
+        public Class(Class @class)
+            : base(@class)
+        {
+            Bases = new List<BaseClassSpecifier>(@class.Bases);
+            Fields = new List<Field>(@class.Fields);
+            Properties = new List<Property>(@class.Properties);
+            Methods = new List<Method>(@class.Methods);
+            Specifiers = new List<AccessSpecifierDecl>(@class.Specifiers);
+            IsPOD = @class.IsPOD;
+            Type = @class.Type;
+            Layout = new ClassLayout(@class.Layout);
+            IsAbstract = @class.IsAbstract;
+            IsUnion = @class.IsUnion;
+            IsOpaque = @class.IsOpaque;
+            IsDynamic = @class.IsDynamic;
+            IsPolymorphic = @class.IsPolymorphic;
+            HasNonTrivialDefaultConstructor = @class.HasNonTrivialDefaultConstructor;
+            HasNonTrivialCopyConstructor = @class.HasNonTrivialCopyConstructor;
+            HasNonTrivialDestructor = @class.HasNonTrivialDestructor;
+            IsStatic = @class.IsStatic;
         }
 
         public bool HasBase
@@ -130,7 +167,7 @@ namespace CppSharp.AST
             {
                 foreach (var @base in Bases)
                 {
-                    if (@base.IsClass && !@base.Class.Ignore)
+                    if (@base.IsClass && @base.Class.IsDeclared)
                         return @base.Class;
                 }
 
@@ -138,6 +175,23 @@ namespace CppSharp.AST
             }
         }
 
+        public bool HasNonIgnoredBase
+        {
+            get
+            {
+                return HasBaseClass && !IsValueType
+                       && Bases[0].Class != null
+                       && !Bases[0].Class.IsValueType
+                       && Bases[0].Class.GenerationKind != GenerationKind.None;
+            }
+        }
+
+        public bool NeedsBase
+        {
+            get { return HasNonIgnoredBase && IsGenerated; }
+        }
+
+        // When we have an interface, this is the class mapped to that interface.
         public Class OriginalClass { get; set; }
 
         public bool IsValueType
@@ -153,6 +207,11 @@ namespace CppSharp.AST
         public bool IsInterface
         {
             get { return Type == ClassType.Interface; }
+        }
+
+        public bool IsAbstractImpl
+        {
+            get { return Methods.Any(m => m.SynthKind == FunctionSynthKind.AbstractImplCall); }
         }
 
         public IEnumerable<Method> Constructors
@@ -180,126 +239,39 @@ namespace CppSharp.AST
             }
         }
 
-        public IEnumerable<Method> FindOperator(CXXOperatorKind kind)
+        public override IEnumerable<Function> FindOperator(CXXOperatorKind kind)
         {
-            return Operators.Where(method => method.OperatorKind == kind);
+            return Methods.Where(m => m.OperatorKind == kind);
         }
 
-        public IEnumerable<Method> FindMethodByOriginalName(string name)
-        {
-            return Methods.Where(method => method.OriginalName == name);
-        }
-
-        public IEnumerable<Variable> FindVariableByOriginalName(string originalName)
-        {
-            return Variables.Where(v => v.OriginalName == originalName);
-        }
-
-        public override IEnumerable<Function> GetFunctionOverloads(Function function)
+        public override IEnumerable<Function> GetOverloads(Function function)
         {
             if (function.IsOperator)
-                return FindOperator(function.OperatorKind);
-            return Methods.Where(method => method.Name == function.Name);
+                return Methods.Where(fn => fn.OperatorKind == function.OperatorKind);
+
+            var methods = Methods.Where(m => m.Name == function.Name).ToList();
+            if (methods.Count != 0)
+                return methods;
+
+            return base.GetOverloads(function);
         }
 
-        public IEnumerable<T> FindHierarchy<T>(Func<Class, IEnumerable<T>> func)
-            where T : Declaration
+        public Method FindMethod(string name)
         {
-            foreach (var elem in func(this))
-                yield return elem;
-
-            foreach (var @base in Bases)
-            {
-                if (!@base.IsClass) continue;
-                foreach(var elem in @base.Class.FindHierarchy<T>(func))
-                    yield return elem;
-            }
+            return Methods
+                .Concat(Templates.OfType<FunctionTemplate>()
+                    .Select(t => t.TemplatedFunction)
+                    .OfType<Method>())
+                .FirstOrDefault(m => m.Name == name);
         }
 
-        public Method GetRootBaseMethod(Method @override, bool onlyFirstBase = false)
+        public Method FindMethodByUSR(string usr)
         {
-            return (from @base in Bases
-                    where @base.IsClass && (!onlyFirstBase || !@base.Class.IsInterface)
-                    let baseMethod = (
-                        from method in @base.Class.Methods
-                        where
-                            method.Name == @override.Name &&
-                            method.ReturnType == @override.ReturnType &&
-                            method.Parameters.Count == @override.Parameters.Count &&
-                            method.Parameters.SequenceEqual(@override.Parameters,
-                                                            new ParameterTypeComparer())
-                        select method).FirstOrDefault()
-                    let rootBaseMethod = @base.Class.GetRootBaseMethod(@override) ?? baseMethod
-                    where rootBaseMethod != null || onlyFirstBase
-                    select rootBaseMethod).FirstOrDefault();
-        }
-
-        public Property GetRootBaseProperty(Property @override, bool onlyFirstBase = false)
-        {
-            return (from @base in Bases
-                    where (!onlyFirstBase || !@base.Class.IsInterface) && @base.IsClass
-                    let baseProperty = (
-                        from property in @base.Class.Properties
-                        where
-                            property.Name == @override.Name &&
-                            property.Parameters.Count == @override.Parameters.Count &&
-                            property.Parameters.SequenceEqual(@override.Parameters,
-                                                            new ParameterTypeComparer())
-                        select property).FirstOrDefault()
-                    let rootBaseProperty = @base.Class.GetRootBaseProperty(@override) ?? baseProperty
-                    where rootBaseProperty != null || onlyFirstBase
-                    select rootBaseProperty).FirstOrDefault();
-        }
-
-        public Property GetPropertyByName(string propertyName)
-        {
-            Property property = Properties.FirstOrDefault(m => m.Name == propertyName);
-            if (property != null)
-                return property;
-            Declaration decl;
-            foreach (var baseClassSpecifier in Bases.Where(
-                b => b.Type.IsTagDecl(out decl) && !b.Class.Ignore))
-            {
-                property = baseClassSpecifier.Class.GetPropertyByName(propertyName);
-                if (property != null)
-                    return property;
-            }
-            return null;
-        }
-
-        public Property GetPropertyByConstituentMethod(Method method)
-        {
-            var property = Properties.FirstOrDefault(p => p.GetMethod == method);
-            if (property != null)
-                return property;
-            property = Properties.FirstOrDefault(p => p.SetMethod == method);
-            if (property != null)
-                return property;
-            Declaration decl;
-            foreach (BaseClassSpecifier @base in Bases.Where(b => b.Type.IsTagDecl(out decl)))
-            {
-                property = @base.Class.GetPropertyByConstituentMethod(method);
-                if (property != null)
-                    return property;
-            }
-            return null;
-        }
-
-        public Method GetMethodByName(string methodName)
-        {
-            var method = Methods.FirstOrDefault(
-                // HACK: because of the non-shared v-table entries bug one copy may have been renamed and the other not
-                m => string.Compare(m.Name, methodName, StringComparison.OrdinalIgnoreCase) == 0);
-            if (method != null)
-                return method;
-            Declaration decl;
-            foreach (BaseClassSpecifier @base in Bases.Where(b => b.Type.IsTagDecl(out decl)))
-            {
-                method = @base.Class.GetMethodByName(methodName);
-                if (method != null)
-                    return method;
-            }
-            return null;
+            return Methods
+                .Concat(Templates.OfType<FunctionTemplate>()
+                    .Select(t => t.TemplatedFunction)
+                    .OfType<Method>())
+                .FirstOrDefault(m => m.USR == usr);
         }
 
         public override T Visit<T>(IDeclVisitor<T> visitor)
